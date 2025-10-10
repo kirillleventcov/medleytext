@@ -1,6 +1,6 @@
 use gpui::{
     App, Application, Bounds, Context, FocusHandle, Focusable, KeyBinding, KeyDownEvent, Render,
-    Window, WindowBounds, WindowOptions, actions, div, prelude::*, px, rgb, size,
+    Rgba, Window, WindowBounds, WindowOptions, actions, div, prelude::*, px, rgb, size,
 };
 
 actions!(
@@ -15,6 +15,169 @@ struct TextEditor {
     cursor_position: usize,
     focus_handle: FocusHandle,
     current_file: Option<String>,
+}
+
+#[derive(Debug, Clone)]
+enum MarkdownToken {
+    Heading(usize), // # level
+    Bold,           // **text**
+    Italic,         // *text* or _text_
+    Code,           // `code`
+    Link,           // [text](url)
+    ListItem,       // - or * or 1.
+    Blockquote,     // >
+    CodeBlock,      // ```
+    Normal,
+}
+
+struct MarkdownHighlighter;
+
+impl MarkdownHighlighter {
+    fn get_color(token: &MarkdownToken) -> Rgba {
+        match token {
+            MarkdownToken::Heading(1) => rgb(0x569CD6), // Blue
+            MarkdownToken::Heading(2) => rgb(0x4EC9B0), // Teal
+            MarkdownToken::Heading(_) => rgb(0x4FC1FF), // Light blue
+            MarkdownToken::Bold => rgb(0xDCDCAA),       // Yellow
+            MarkdownToken::Italic => rgb(0xCE9178),     // Orange
+            MarkdownToken::Code => rgb(0xD16969),       // Red
+            MarkdownToken::Link => rgb(0x9CDCFE),       // Cyan
+            MarkdownToken::ListItem => rgb(0xC586C0),   // Purple
+            MarkdownToken::Blockquote => rgb(0x6A9955), // Green
+            MarkdownToken::CodeBlock => rgb(0xD16969),  // Red
+            MarkdownToken::Normal => rgb(0xD4D4D4),     // Default
+        }
+    }
+
+    fn tokenize_line(line: &str) -> Vec<(String, MarkdownToken)> {
+        let mut tokens = Vec::new();
+
+        if line.starts_with("# ") {
+            tokens.push((line.to_string(), MarkdownToken::Heading(1)));
+            return tokens;
+        } else if line.starts_with("## ") {
+            tokens.push((line.to_string(), MarkdownToken::Heading(2)));
+            return tokens;
+        } else if line.starts_with("### ") {
+            tokens.push((line.to_string(), MarkdownToken::Heading(3)));
+            return tokens;
+        } else if line.starts_with("#### ") {
+            tokens.push((line.to_string(), MarkdownToken::Heading(4)));
+            return tokens;
+        } else if line.starts_with("##### ") {
+            tokens.push((line.to_string(), MarkdownToken::Heading(5)));
+            return tokens;
+        } else if line.starts_with("###### ") {
+            tokens.push((line.to_string(), MarkdownToken::Heading(6)));
+            return tokens;
+        }
+
+        if line.starts_with("```") {
+            tokens.push((line.to_string(), MarkdownToken::CodeBlock));
+            return tokens;
+        }
+
+        if line.starts_with("> ") {
+            tokens.push((line.to_string(), MarkdownToken::Blockquote));
+            return tokens;
+        }
+
+        if line.starts_with("- ")
+            || line.starts_with("* ")
+            || (line.len() > 2
+                && line.chars().next().unwrap().is_ascii_digit()
+                && &line[1..3] == ". ")
+        {
+            tokens.push((line.to_string(), MarkdownToken::ListItem));
+            return tokens;
+        }
+
+        let mut current = String::new();
+        let mut chars = line.chars().peekable();
+
+        while let Some(ch) = chars.next() {
+            match ch {
+                '`' => {
+                    if !current.is_empty() {
+                        tokens.push((current.clone(), MarkdownToken::Normal));
+                        current.clear();
+                    }
+                    current.push(ch);
+                    while let Some(next_ch) = chars.next() {
+                        current.push(next_ch);
+                        if next_ch == '`' {
+                            break;
+                        }
+                    }
+                    tokens.push((current.clone(), MarkdownToken::Code));
+                    current.clear();
+                }
+                '*' if chars.peek() == Some(&'*') => {
+                    if !current.is_empty() {
+                        tokens.push((current.clone(), MarkdownToken::Normal));
+                        current.clear();
+                    }
+                    current.push(ch);
+                    current.push(chars.next().unwrap());
+                    while let Some(next_ch) = chars.next() {
+                        current.push(next_ch);
+                        if next_ch == '*' && chars.peek() == Some(&'*') {
+                            current.push(chars.next().unwrap());
+                            break;
+                        }
+                    }
+                    tokens.push((current.clone(), MarkdownToken::Bold));
+                    current.clear();
+                }
+                '*' | '_' => {
+                    if !current.is_empty() {
+                        tokens.push((current.clone(), MarkdownToken::Normal));
+                        current.clear();
+                    }
+                    current.push(ch);
+                    let delimiter = ch;
+
+                    while let Some(next_ch) = chars.next() {
+                        current.push(next_ch);
+                        if next_ch == delimiter {
+                            break;
+                        }
+                    }
+                    tokens.push((current.clone(), MarkdownToken::Italic));
+                    current.clear();
+                }
+                '[' => {
+                    if !current.is_empty() {
+                        tokens.push((current.clone(), MarkdownToken::Normal));
+                        current.clear();
+                    }
+                    current.push(ch);
+
+                    while let Some(next_ch) = chars.next() {
+                        current.push(next_ch);
+                        if next_ch == ')' && current.contains("](") {
+                            break;
+                        }
+                    }
+                    tokens.push((current.clone(), MarkdownToken::Link));
+                    current.clear();
+                }
+                _ => {
+                    current.push(ch);
+                }
+            }
+        }
+
+        if !current.is_empty() {
+            tokens.push((current, MarkdownToken::Normal));
+        }
+
+        if tokens.is_empty() {
+            tokens.push((line.to_string(), MarkdownToken::Normal));
+        }
+
+        tokens
+    }
 }
 
 impl TextEditor {
@@ -233,26 +396,60 @@ impl Render for TextEditor {
                 for line in lines {
                     let line_start = current_pos;
                     let line_end = current_pos + line.len();
+                    let cursor_on_line =
+                        self.cursor_position >= line_start && self.cursor_position <= line_end;
 
-                    if self.cursor_position >= line_start && self.cursor_position <= line_end {
-                        let col = self.cursor_position - line_start;
-                        let before = &line[..col];
-                        let after = &line[col..];
+                    let tokens = MarkdownHighlighter::tokenize_line(line);
 
-                        result = result.child(
-                            div()
-                                .flex()
-                                .flex_row()
-                                .child(before.to_string())
-                                .child(div().w(px(4.0)).h(px(18.0)).bg(rgb(0xcccccc)))
-                                .child(after.to_string()),
-                        );
-                    } else {
-                        // Normal line without cursor
-                        result = result.child(div().child(line.to_string()));
+                    let mut line_div = div().flex().flex_row();
+                    let mut char_count = 0;
+
+                    for (text, token_type) in tokens {
+                        let token_color = MarkdownHighlighter::get_color(&token_type);
+                        let token_start = char_count;
+                        let token_end = char_count + text.len();
+
+                        if cursor_on_line {
+                            let cursor_col = self.cursor_position - line_start;
+
+                            if cursor_col >= token_start && cursor_col < token_end {
+                                let col_in_token = cursor_col - token_start;
+                                let before = &text[..col_in_token];
+                                let after = &text[col_in_token..];
+
+                                if !before.is_empty() {
+                                    line_div = line_div.child(
+                                        div().text_color(token_color).child(before.to_string()),
+                                    );
+                                }
+                                line_div =
+                                    line_div.child(div().w(px(4.0)).h(px(18.0)).bg(rgb(0xcccccc)));
+                                if !after.is_empty() {
+                                    line_div = line_div.child(
+                                        div().text_color(token_color).child(after.to_string()),
+                                    );
+                                }
+                            } else if cursor_col == token_end && token_end == line.len() {
+                                line_div = line_div
+                                    .child(div().text_color(token_color).child(text.clone()));
+                                if char_count + text.len() == line.len() {
+                                    line_div = line_div
+                                        .child(div().w(px(4.0)).h(px(18.0)).bg(rgb(0xcccccc)));
+                                }
+                            } else {
+                                line_div = line_div
+                                    .child(div().text_color(token_color).child(text.clone()));
+                            }
+                        } else {
+                            line_div =
+                                line_div.child(div().text_color(token_color).child(text.clone()));
+                        }
+
+                        char_count += text.len();
                     }
 
-                    current_pos = line_end + 1; // +1 for the newline character
+                    result = result.child(line_div);
+                    current_pos = line_end + 1;
                 }
 
                 result
