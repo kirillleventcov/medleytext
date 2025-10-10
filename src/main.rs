@@ -162,9 +162,6 @@ impl Focusable for TextEditor {
 
 impl Render for TextEditor {
     fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-        let text_before_cursor = &self.content[..self.cursor_position];
-        let text_after_cursor = &self.content[self.cursor_position..];
-
         div()
             .track_focus(&self.focus_handle(cx))
             .on_action(cx.listener(Self::handle_move_left))
@@ -209,11 +206,47 @@ impl Render for TextEditor {
             .child(
                 div()
                     .flex()
-                    .flex_row()
-                    .flex_wrap()
-                    .child(text_before_cursor.to_string())
-                    .child(div().w(px(2.0)).h(px(16.0)).bg(rgb(0xffffff)))
-                    .child(text_after_cursor.to_string()),
+                    .flex_col()
+                    .gap_1()
+                    .child({
+                        // Render text with visible cursor
+                        let lines: Vec<&str> = self.content.split('\n').collect();
+                        let mut current_pos = 0;
+                        let mut result = div().flex().flex_col();
+
+                        for line in lines {
+                            let line_start = current_pos;
+                            let line_end = current_pos + line.len();
+
+                            if self.cursor_position >= line_start && self.cursor_position <= line_end {
+                                // Cursor is on this line
+                                let col = self.cursor_position - line_start;
+                                let before = &line[..col];
+                                let after = &line[col..];
+
+                                result = result.child(
+                                    div()
+                                        .flex()
+                                        .flex_row()
+                                        .child(before.to_string())
+                                        .child(
+                                            div()
+                                                .w(px(8.0))
+                                                .h(px(18.0))
+                                                .bg(rgb(0x00ff00))
+                                        )
+                                        .child(after.to_string())
+                                );
+                            } else {
+                                // Normal line without cursor
+                                result = result.child(div().child(line.to_string()));
+                            }
+
+                            current_pos = line_end + 1; // +1 for the newline character
+                        }
+
+                        result
+                    }),
             )
     }
 }
