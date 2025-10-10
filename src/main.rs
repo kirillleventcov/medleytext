@@ -1,21 +1,13 @@
 use gpui::{
-    actions, div, prelude::*, px, rgb, size, App, Application, Bounds, Context, FocusHandle,
-    Focusable, KeyBinding, KeyDownEvent, Render, Window, WindowBounds, WindowOptions,
+    App, Application, Bounds, Context, FocusHandle, Focusable, KeyBinding, KeyDownEvent, Render,
+    Window, WindowBounds, WindowOptions, actions, div, prelude::*, px, rgb, size,
 };
 
 // Define actions for text editing
 actions!(
     editor,
     [
-        MoveLeft,
-        MoveRight,
-        MoveUp,
-        MoveDown,
-        Backspace,
-        Enter,
-        Save,
-        Open,
-        Quit
+        MoveLeft, MoveRight, MoveUp, MoveDown, Backspace, Enter, Save, Open, Quit
     ]
 );
 
@@ -180,7 +172,8 @@ impl Render for TextEditor {
                     if key_char.len() == 1
                         && !event.keystroke.modifiers.control
                         && !event.keystroke.modifiers.alt
-                        && !event.keystroke.modifiers.platform {
+                        && !event.keystroke.modifiers.platform
+                    {
                         if let Some(c) = key_char.chars().next() {
                             if c.is_ascii_graphic() || c == ' ' {
                                 editor.insert_char(c, cx);
@@ -203,51 +196,40 @@ impl Render for TextEditor {
                     .text_color(rgb(0x808080))
                     .child("MedleyText Editor - Ctrl+S: save | Ctrl+O: open | Ctrl+Q: quit"),
             )
-            .child(
-                div()
-                    .flex()
-                    .flex_col()
-                    .gap_1()
-                    .child({
-                        // Render text with visible cursor
-                        let lines: Vec<&str> = self.content.split('\n').collect();
-                        let mut current_pos = 0;
-                        let mut result = div().flex().flex_col();
+            .child(div().flex().flex_col().gap_1().child({
+                // Render text with visible cursor
+                let lines: Vec<&str> = self.content.split('\n').collect();
+                let mut current_pos = 0;
+                let mut result = div().flex().flex_col();
 
-                        for line in lines {
-                            let line_start = current_pos;
-                            let line_end = current_pos + line.len();
+                for line in lines {
+                    let line_start = current_pos;
+                    let line_end = current_pos + line.len();
 
-                            if self.cursor_position >= line_start && self.cursor_position <= line_end {
-                                // Cursor is on this line
-                                let col = self.cursor_position - line_start;
-                                let before = &line[..col];
-                                let after = &line[col..];
+                    if self.cursor_position >= line_start && self.cursor_position <= line_end {
+                        // Cursor is on this line
+                        let col = self.cursor_position - line_start;
+                        let before = &line[..col];
+                        let after = &line[col..];
 
-                                result = result.child(
-                                    div()
-                                        .flex()
-                                        .flex_row()
-                                        .child(before.to_string())
-                                        .child(
-                                            div()
-                                                .w(px(8.0))
-                                                .h(px(18.0))
-                                                .bg(rgb(0x00ff00))
-                                        )
-                                        .child(after.to_string())
-                                );
-                            } else {
-                                // Normal line without cursor
-                                result = result.child(div().child(line.to_string()));
-                            }
+                        result = result.child(
+                            div()
+                                .flex()
+                                .flex_row()
+                                .child(before.to_string())
+                                .child(div().w(px(8.0)).h(px(18.0)).bg(rgb(0x00ff00)))
+                                .child(after.to_string()),
+                        );
+                    } else {
+                        // Normal line without cursor
+                        result = result.child(div().child(line.to_string()));
+                    }
 
-                            current_pos = line_end + 1; // +1 for the newline character
-                        }
+                    current_pos = line_end + 1; // +1 for the newline character
+                }
 
-                        result
-                    }),
-            )
+                result
+            }))
     }
 }
 
