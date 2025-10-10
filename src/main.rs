@@ -6,7 +6,7 @@ use gpui::{
 actions!(
     editor,
     [
-        MoveLeft, MoveRight, MoveUp, MoveDown, Backspace, Enter, Save, Open, Quit
+        MoveLeft, MoveRight, MoveUp, MoveDown, Backspace, Enter, Save, Quit
     ]
 );
 
@@ -14,14 +14,34 @@ struct TextEditor {
     content: String,
     cursor_position: usize,
     focus_handle: FocusHandle,
+    current_file: Option<String>,
 }
 
 impl TextEditor {
-    fn new(cx: &mut Context<Self>) -> Self {
+    fn with_file(file_path: Option<String>, cx: &mut Context<Self>) -> Self {
+        let (content, current_file) = if let Some(path) = file_path {
+            match std::fs::read_to_string(&path) {
+                Ok(content) => {
+                    println!("Loaded file: {}", path);
+                    (content, Some(path))
+                }
+                Err(e) => {
+                    eprintln!("Failed to open file: {}", e);
+                    (String::new(), Some(path))
+                }
+            }
+        } else {
+            (
+                String::from("Welcome to MedleyText!\n\nStart typing..."),
+                None,
+            )
+        };
+
         Self {
-            content: String::from("Welcome to MedleyText!\n\nStart typing..."),
+            content,
             cursor_position: 0,
             focus_handle: cx.focus_handle(),
+            current_file,
         }
     }
 
@@ -122,21 +142,32 @@ impl TextEditor {
     }
 
     fn handle_save(&mut self, _: &Save, _: &mut Window, _cx: &mut Context<Self>) {
-        if let Err(e) = std::fs::write("output.txt", &self.content) {
+        use std::io::{self, Write};
+
+        let path = if let Some(ref current) = self.current_file {
+            current.clone()
+        } else {
+            print!("Enter file path to save: ");
+            io::stdout().flush().unwrap();
+            let mut input = String::new();
+            if io::stdin().read_line(&mut input).is_ok() {
+                input.trim().to_string()
+            } else {
+                eprintln!("Failed to read input");
+                return;
+            }
+        };
+
+        if path.is_empty() {
+            eprintln!("No file path provided");
+            return;
+        }
+
+        if let Err(e) = std::fs::write(&path, &self.content) {
             eprintln!("Failed to save file: {}", e);
         } else {
-            println!("File saved successfully!");
-        }
-    }
-
-    fn handle_open(&mut self, _: &Open, _: &mut Window, cx: &mut Context<Self>) {
-        if let Ok(content) = std::fs::read_to_string("output.txt") {
-            self.content = content;
-            self.cursor_position = self.content.len();
-            println!("File loaded successfully!");
-            cx.notify();
-        } else {
-            println!("No saved file found.");
+            self.current_file = Some(path.clone());
+            println!("File saved to: {}", path);
         }
     }
 
@@ -162,7 +193,6 @@ impl Render for TextEditor {
             .on_action(cx.listener(Self::handle_backspace))
             .on_action(cx.listener(Self::handle_enter))
             .on_action(cx.listener(Self::handle_save))
-            .on_action(cx.listener(Self::handle_open))
             .on_action(cx.listener(Self::handle_quit))
             .on_key_down(cx.listener(|editor, event: &KeyDownEvent, _, cx| {
                 // Handle regular text input
@@ -188,12 +218,13 @@ impl Render for TextEditor {
             .p_4()
             .font_family("monospace")
             .text_sm()
-            .child(
-                div()
-                    .mb_2()
-                    .text_color(rgb(0x808080))
-                    .child("MedleyText Editor - Ctrl+S: save | Ctrl+O: open | Ctrl+Q: quit"),
-            )
+            .child(div().mb_2().text_color(rgb(0x808080)).child(format!(
+                        "MedleyText Editor - {} | Ctrl+S: save | Ctrl+Q: quit",
+                        self.current_file
+                            .as_ref()
+                            .map(|p| p.as_str())
+                            .unwrap_or("[unsaved]")
+                    )))
             .child(div().flex().flex_col().gap_1().child({
                 let lines: Vec<&str> = self.content.split('\n').collect();
                 let mut current_pos = 0;
@@ -230,7 +261,10 @@ impl Render for TextEditor {
 }
 
 fn main() {
-    Application::new().run(|cx: &mut App| {
+    let args: Vec<String> = std::env::args().collect();
+    let file_path = args.get(1).cloned();
+
+    Application::new().run(move |cx: &mut App| {
         cx.bind_keys([
             KeyBinding::new("left", MoveLeft, None),
             KeyBinding::new("right", MoveRight, None),
@@ -239,17 +273,17 @@ fn main() {
             KeyBinding::new("backspace", Backspace, None),
             KeyBinding::new("enter", Enter, None),
             KeyBinding::new("ctrl-s", Save, None),
-            KeyBinding::new("ctrl-o", Open, None),
             KeyBinding::new("ctrl-q", Quit, None),
         ]);
 
         let bounds = Bounds::centered(None, size(px(800.0), px(600.0)), cx);
+        let file_path_clone = file_path.clone();
         cx.open_window(
             WindowOptions {
                 window_bounds: Some(WindowBounds::Windowed(bounds)),
                 ..Default::default()
             },
-            |_window, cx| cx.new(TextEditor::new),
+            |_window, cx| cx.new(|cx| TextEditor::with_file(file_path_clone, cx)),
         )
         .unwrap();
     });
