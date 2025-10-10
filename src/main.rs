@@ -3,7 +3,6 @@ use gpui::{
     Window, WindowBounds, WindowOptions, actions, div, prelude::*, px, rgb, size,
 };
 
-// Define actions for text editing
 actions!(
     editor,
     [
@@ -168,7 +167,6 @@ impl Render for TextEditor {
             .on_key_down(cx.listener(|editor, event: &KeyDownEvent, _, cx| {
                 // Handle regular text input
                 if let Some(key_char) = &event.keystroke.key_char {
-                    // Only insert printable characters (not control keys)
                     if key_char.len() == 1
                         && !event.keystroke.modifiers.control
                         && !event.keystroke.modifiers.alt
@@ -197,7 +195,6 @@ impl Render for TextEditor {
                     .child("MedleyText Editor - Ctrl+S: save | Ctrl+O: open | Ctrl+Q: quit"),
             )
             .child(div().flex().flex_col().gap_1().child({
-                // Render text with visible cursor
                 let lines: Vec<&str> = self.content.split('\n').collect();
                 let mut current_pos = 0;
                 let mut result = div().flex().flex_col();
@@ -207,7 +204,6 @@ impl Render for TextEditor {
                     let line_end = current_pos + line.len();
 
                     if self.cursor_position >= line_start && self.cursor_position <= line_end {
-                        // Cursor is on this line
                         let col = self.cursor_position - line_start;
                         let before = &line[..col];
                         let after = &line[col..];
@@ -217,7 +213,7 @@ impl Render for TextEditor {
                                 .flex()
                                 .flex_row()
                                 .child(before.to_string())
-                                .child(div().w(px(8.0)).h(px(18.0)).bg(rgb(0x00ff00)))
+                                .child(div().w(px(4.0)).h(px(18.0)).bg(rgb(0xcccccc)))
                                 .child(after.to_string()),
                         );
                     } else {
@@ -235,7 +231,6 @@ impl Render for TextEditor {
 
 fn main() {
     Application::new().run(|cx: &mut App| {
-        // Bind keyboard shortcuts to actions
         cx.bind_keys([
             KeyBinding::new("left", MoveLeft, None),
             KeyBinding::new("right", MoveRight, None),
