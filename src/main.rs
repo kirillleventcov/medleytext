@@ -1,51 +1,74 @@
 use gpui::{
-    App, Application, Bounds, Context, Render, Window, WindowBounds, WindowOptions, div,
-    prelude::*, px, rgb, size,
+    actions, div, prelude::*, px, rgb, size, App, Application, Bounds, Context, FocusHandle,
+    Focusable, KeyBinding, KeyDownEvent, Render, Window, WindowBounds, WindowOptions,
 };
+
+// Define actions for text editing
+actions!(
+    editor,
+    [
+        MoveLeft,
+        MoveRight,
+        MoveUp,
+        MoveDown,
+        Backspace,
+        Enter,
+        Save,
+        Open,
+        Quit
+    ]
+);
 
 struct TextEditor {
     content: String,
     cursor_position: usize,
+    focus_handle: FocusHandle,
 }
 
 impl TextEditor {
-    fn new() -> Self {
+    fn new(cx: &mut Context<Self>) -> Self {
         Self {
             content: String::from("Welcome to MedleyText!\n\nStart typing..."),
             cursor_position: 0,
+            focus_handle: cx.focus_handle(),
         }
     }
 
-    fn insert_char(&mut self, c: char) {
+    fn insert_char(&mut self, c: char, cx: &mut Context<Self>) {
         self.content.insert(self.cursor_position, c);
         self.cursor_position += 1;
+        cx.notify();
     }
 
-    fn backspace(&mut self) {
+    fn handle_backspace(&mut self, _: &Backspace, _: &mut Window, cx: &mut Context<Self>) {
         if self.cursor_position > 0 {
             self.cursor_position -= 1;
             self.content.remove(self.cursor_position);
+            cx.notify();
         }
     }
 
-    fn insert_newline(&mut self) {
+    fn handle_enter(&mut self, _: &Enter, _: &mut Window, cx: &mut Context<Self>) {
         self.content.insert(self.cursor_position, '\n');
         self.cursor_position += 1;
+        cx.notify();
     }
 
-    fn move_cursor_left(&mut self) {
+    fn handle_move_left(&mut self, _: &MoveLeft, _: &mut Window, cx: &mut Context<Self>) {
         if self.cursor_position > 0 {
             self.cursor_position -= 1;
+            cx.notify();
         }
     }
 
-    fn move_cursor_right(&mut self) {
+    fn handle_move_right(&mut self, _: &MoveRight, _: &mut Window, cx: &mut Context<Self>) {
         if self.cursor_position < self.content.len() {
             self.cursor_position += 1;
+            cx.notify();
         }
     }
 
-    fn move_cursor_up(&mut self) {
+    fn handle_move_up(&mut self, _: &MoveUp, _: &mut Window, cx: &mut Context<Self>) {
         let lines: Vec<&str> = self.content.split('\n').collect();
         let mut current_pos = 0;
         let mut current_line = 0;
@@ -72,10 +95,11 @@ impl TextEditor {
                 new_pos += line.len() + 1;
             }
             self.cursor_position = new_pos;
+            cx.notify();
         }
     }
 
-    fn move_cursor_down(&mut self) {
+    fn handle_move_down(&mut self, _: &MoveDown, _: &mut Window, cx: &mut Context<Self>) {
         let lines: Vec<&str> = self.content.split('\n').collect();
         let mut current_pos = 0;
         let mut current_line = 0;
@@ -102,10 +126,11 @@ impl TextEditor {
                 new_pos += line.len() + 1;
             }
             self.cursor_position = new_pos;
+            cx.notify();
         }
     }
 
-    fn save_file(&self) {
+    fn handle_save(&mut self, _: &Save, _: &mut Window, _cx: &mut Context<Self>) {
         if let Err(e) = std::fs::write("output.txt", &self.content) {
             eprintln!("Failed to save file: {}", e);
         } else {
@@ -113,23 +138,60 @@ impl TextEditor {
         }
     }
 
-    fn load_file(&mut self) {
+    fn handle_open(&mut self, _: &Open, _: &mut Window, cx: &mut Context<Self>) {
         if let Ok(content) = std::fs::read_to_string("output.txt") {
             self.content = content;
             self.cursor_position = self.content.len();
             println!("File loaded successfully!");
+            cx.notify();
         } else {
             println!("No saved file found.");
         }
     }
+
+    fn handle_quit(&mut self, _: &Quit, _: &mut Window, cx: &mut Context<Self>) {
+        cx.quit();
+    }
+}
+
+impl Focusable for TextEditor {
+    fn focus_handle(&self, _: &App) -> FocusHandle {
+        self.focus_handle.clone()
+    }
 }
 
 impl Render for TextEditor {
-    fn render(&mut self, _window: &mut Window, _cx: &mut Context<Self>) -> impl IntoElement {
+    fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let text_before_cursor = &self.content[..self.cursor_position];
         let text_after_cursor = &self.content[self.cursor_position..];
 
         div()
+            .track_focus(&self.focus_handle(cx))
+            .on_action(cx.listener(Self::handle_move_left))
+            .on_action(cx.listener(Self::handle_move_right))
+            .on_action(cx.listener(Self::handle_move_up))
+            .on_action(cx.listener(Self::handle_move_down))
+            .on_action(cx.listener(Self::handle_backspace))
+            .on_action(cx.listener(Self::handle_enter))
+            .on_action(cx.listener(Self::handle_save))
+            .on_action(cx.listener(Self::handle_open))
+            .on_action(cx.listener(Self::handle_quit))
+            .on_key_down(cx.listener(|editor, event: &KeyDownEvent, _, cx| {
+                // Handle regular text input
+                if let Some(key_char) = &event.keystroke.key_char {
+                    // Only insert printable characters (not control keys)
+                    if key_char.len() == 1
+                        && !event.keystroke.modifiers.control
+                        && !event.keystroke.modifiers.alt
+                        && !event.keystroke.modifiers.platform {
+                        if let Some(c) = key_char.chars().next() {
+                            if c.is_ascii_graphic() || c == ' ' {
+                                editor.insert_char(c, cx);
+                            }
+                        }
+                    }
+                }
+            }))
             .flex()
             .flex_col()
             .size_full()
@@ -158,13 +220,26 @@ impl Render for TextEditor {
 
 fn main() {
     Application::new().run(|cx: &mut App| {
+        // Bind keyboard shortcuts to actions
+        cx.bind_keys([
+            KeyBinding::new("left", MoveLeft, None),
+            KeyBinding::new("right", MoveRight, None),
+            KeyBinding::new("up", MoveUp, None),
+            KeyBinding::new("down", MoveDown, None),
+            KeyBinding::new("backspace", Backspace, None),
+            KeyBinding::new("enter", Enter, None),
+            KeyBinding::new("ctrl-s", Save, None),
+            KeyBinding::new("ctrl-o", Open, None),
+            KeyBinding::new("ctrl-q", Quit, None),
+        ]);
+
         let bounds = Bounds::centered(None, size(px(800.0), px(600.0)), cx);
         cx.open_window(
             WindowOptions {
                 window_bounds: Some(WindowBounds::Windowed(bounds)),
                 ..Default::default()
             },
-            |_window, cx| cx.new(|_| TextEditor::new()),
+            |_window, cx| cx.new(TextEditor::new),
         )
         .unwrap();
     });
