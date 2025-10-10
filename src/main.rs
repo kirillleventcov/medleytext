@@ -19,14 +19,16 @@ struct TextEditor {
 
 #[derive(Debug, Clone)]
 enum MarkdownToken {
-    Heading(usize), // # level
-    Bold,           // **text**
-    Italic,         // *text* or _text_
-    Code,           // `code`
-    Link,           // [text](url)
-    ListItem,       // - or * or 1.
-    Blockquote,     // >
-    CodeBlock,      // ```
+    Heading(usize),    // # level
+    Bold,              // **text**
+    Italic,            // *text* or _text_
+    Code,              // `code`
+    Link,              // [text](url)
+    ListItem,          // - or * or 1.
+    CheckboxChecked,   // - [X] or - [x]
+    CheckboxUnchecked, // - [ ]
+    Blockquote,        // >
+    CodeBlock,         // ```
     Normal,
 }
 
@@ -35,17 +37,19 @@ struct MarkdownHighlighter;
 impl MarkdownHighlighter {
     fn get_color(token: &MarkdownToken) -> Rgba {
         match token {
-            MarkdownToken::Heading(1) => rgb(0x569CD6), // Blue
-            MarkdownToken::Heading(2) => rgb(0x4EC9B0), // Teal
-            MarkdownToken::Heading(_) => rgb(0x4FC1FF), // Light blue
-            MarkdownToken::Bold => rgb(0xDCDCAA),       // Yellow
-            MarkdownToken::Italic => rgb(0xCE9178),     // Orange
-            MarkdownToken::Code => rgb(0xD16969),       // Red
-            MarkdownToken::Link => rgb(0x9CDCFE),       // Cyan
-            MarkdownToken::ListItem => rgb(0xC586C0),   // Purple
-            MarkdownToken::Blockquote => rgb(0x6A9955), // Green
-            MarkdownToken::CodeBlock => rgb(0xD16969),  // Red
-            MarkdownToken::Normal => rgb(0xD4D4D4),     // Default
+            MarkdownToken::Heading(1) => rgb(0x569CD6),        // Blue
+            MarkdownToken::Heading(2) => rgb(0x4EC9B0),        // Teal
+            MarkdownToken::Heading(_) => rgb(0x4FC1FF),        // Light blue
+            MarkdownToken::Bold => rgb(0xDCDCAA),              // Yellow
+            MarkdownToken::Italic => rgb(0xCE9178),            // Orange
+            MarkdownToken::Code => rgb(0xD16969),              // Red
+            MarkdownToken::Link => rgb(0x9CDCFE),              // Cyan
+            MarkdownToken::ListItem => rgb(0xC586C0),          // Purple
+            MarkdownToken::CheckboxChecked => rgb(0x7CB342),   // Green (bright teal)
+            MarkdownToken::CheckboxUnchecked => rgb(0xF48771), // Red-ish (coral)
+            MarkdownToken::Blockquote => rgb(0x6A9955),        // Green
+            MarkdownToken::CodeBlock => rgb(0xD16969),         // Red
+            MarkdownToken::Normal => rgb(0xD4D4D4),            // Default
         }
     }
 
@@ -75,6 +79,19 @@ impl MarkdownHighlighter {
         if line.starts_with("```") {
             tokens.push((line.to_string(), MarkdownToken::CodeBlock));
             return tokens;
+        }
+
+        if line.starts_with("- [") && line.len() >= 5 {
+            let checkbox_char = line.chars().nth(3);
+            if checkbox_char == Some(' ') && line.chars().nth(4) == Some(']') {
+                tokens.push((line.to_string(), MarkdownToken::CheckboxUnchecked));
+                return tokens;
+            } else if (checkbox_char == Some('X') || checkbox_char == Some('x'))
+                && line.chars().nth(4) == Some(']')
+            {
+                tokens.push((line.to_string(), MarkdownToken::CheckboxChecked));
+                return tokens;
+            }
         }
 
         if line.starts_with("> ") {
