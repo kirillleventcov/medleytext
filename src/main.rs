@@ -11,7 +11,10 @@ fn main() {
     let file_path = args.get(1).cloned();
 
     Application::new().run(move |cx: &mut App| {
-        use editor::{Backspace, Enter, MoveDown, MoveLeft, MoveRight, MoveUp, Quit, Save};
+        use editor::{
+            Backspace, Copy, Cut, Enter, MoveDown, MoveLeft, MoveRight, MoveUp, Paste, Quit, Save,
+            SelectDown, SelectLeft, SelectRight, SelectUp,
+        };
 
         cx.bind_keys([
             KeyBinding::new("left", MoveLeft, None),
@@ -22,6 +25,13 @@ fn main() {
             KeyBinding::new("enter", Enter, None),
             KeyBinding::new("ctrl-s", Save, None),
             KeyBinding::new("ctrl-q", Quit, None),
+            KeyBinding::new("ctrl-c", Copy, None),
+            KeyBinding::new("ctrl-v", Paste, None),
+            KeyBinding::new("ctrl-x", Cut, None),
+            KeyBinding::new("shift-left", SelectLeft, None),
+            KeyBinding::new("shift-right", SelectRight, None),
+            KeyBinding::new("shift-up", SelectUp, None),
+            KeyBinding::new("shift-down", SelectDown, None),
         ]);
 
         let bounds = Bounds::centered(None, size(px(800.0), px(600.0)), cx);

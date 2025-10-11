@@ -1,6 +1,6 @@
 use gpui::{
-    App, Context, FocusHandle, Focusable, KeyDownEvent, Render, Window, actions, div, prelude::*,
-    px, rgb,
+    App, ClipboardItem, Context, FocusHandle, Focusable, KeyDownEvent, Render, Window, actions,
+    div, prelude::*, px, rgb,
 };
 
 use crate::markdown::MarkdownHighlighter;
@@ -8,13 +8,28 @@ use crate::markdown::MarkdownHighlighter;
 actions!(
     editor,
     [
-        MoveLeft, MoveRight, MoveUp, MoveDown, Backspace, Enter, Save, Quit
+        MoveLeft,
+        MoveRight,
+        MoveUp,
+        MoveDown,
+        Backspace,
+        Enter,
+        Save,
+        Quit,
+        Copy,
+        Paste,
+        Cut,
+        SelectLeft,
+        SelectRight,
+        SelectUp,
+        SelectDown
     ]
 );
 
 pub struct TextEditor {
     content: String,
     cursor_position: usize,
+    selection_start: Option<usize>,
     focus_handle: FocusHandle,
     current_file: Option<String>,
 }
@@ -42,23 +57,57 @@ impl TextEditor {
         Self {
             content,
             cursor_position: 0,
+            selection_start: None,
             focus_handle: cx.focus_handle(),
             current_file,
         }
     }
 
+    fn get_selection_range(&self) -> Option<(usize, usize)> {
+        self.selection_start.map(|start| {
+            if start < self.cursor_position {
+                (start, self.cursor_position)
+            } else {
+                (self.cursor_position, start)
+            }
+        })
+    }
+
+    fn get_selected_text(&self) -> Option<String> {
+        self.get_selection_range()
+            .map(|(start, end)| self.content[start..end].to_string())
+    }
+
+    fn clear_selection(&mut self) {
+        self.selection_start = None;
+    }
+
+    fn delete_selection(&mut self) -> bool {
+        if let Some((start, end)) = self.get_selection_range() {
+            self.content.drain(start..end);
+            self.cursor_position = start;
+            self.clear_selection();
+            true
+        } else {
+            false
+        }
+    }
+
     fn insert_char(&mut self, c: char, cx: &mut Context<Self>) {
+        self.delete_selection();
         self.content.insert(self.cursor_position, c);
         self.cursor_position += 1;
         cx.notify();
     }
 
     fn handle_backspace(&mut self, _: &Backspace, _: &mut Window, cx: &mut Context<Self>) {
-        if self.cursor_position > 0 {
-            self.cursor_position -= 1;
-            self.content.remove(self.cursor_position);
-            cx.notify();
+        if !self.delete_selection() {
+            if self.cursor_position > 0 {
+                self.cursor_position -= 1;
+                self.content.remove(self.cursor_position);
+            }
         }
+        cx.notify();
     }
 
     fn handle_enter(&mut self, _: &Enter, _: &mut Window, cx: &mut Context<Self>) {
@@ -68,6 +117,7 @@ impl TextEditor {
     }
 
     fn handle_move_left(&mut self, _: &MoveLeft, _: &mut Window, cx: &mut Context<Self>) {
+        self.clear_selection();
         if self.cursor_position > 0 {
             self.cursor_position -= 1;
             cx.notify();
@@ -75,6 +125,7 @@ impl TextEditor {
     }
 
     fn handle_move_right(&mut self, _: &MoveRight, _: &mut Window, cx: &mut Context<Self>) {
+        self.clear_selection();
         if self.cursor_position < self.content.len() {
             self.cursor_position += 1;
             cx.notify();
@@ -82,65 +133,15 @@ impl TextEditor {
     }
 
     fn handle_move_up(&mut self, _: &MoveUp, _: &mut Window, cx: &mut Context<Self>) {
-        let lines: Vec<&str> = self.content.split('\n').collect();
-        let mut current_pos = 0;
-        let mut current_line = 0;
-        let mut col_in_line = 0;
-
-        for (line_idx, line) in lines.iter().enumerate() {
-            if current_pos + line.len() >= self.cursor_position {
-                current_line = line_idx;
-                col_in_line = self.cursor_position - current_pos;
-                break;
-            }
-            current_pos += line.len() + 1;
-        }
-
-        if current_line > 0 {
-            let prev_line_len = lines[current_line - 1].len();
-            let new_col = col_in_line.min(prev_line_len);
-            let mut new_pos = 0;
-            for (i, line) in lines.iter().enumerate() {
-                if i == current_line - 1 {
-                    new_pos += new_col;
-                    break;
-                }
-                new_pos += line.len() + 1;
-            }
-            self.cursor_position = new_pos;
-            cx.notify();
-        }
+        self.clear_selection();
+        self.move_up_internal();
+        cx.notify();
     }
 
     fn handle_move_down(&mut self, _: &MoveDown, _: &mut Window, cx: &mut Context<Self>) {
-        let lines: Vec<&str> = self.content.split('\n').collect();
-        let mut current_pos = 0;
-        let mut current_line = 0;
-        let mut col_in_line = 0;
-
-        for (line_idx, line) in lines.iter().enumerate() {
-            if current_pos + line.len() >= self.cursor_position {
-                current_line = line_idx;
-                col_in_line = self.cursor_position - current_pos;
-                break;
-            }
-            current_pos += line.len() + 1;
-        }
-
-        if current_line < lines.len() - 1 {
-            let next_line_len = lines[current_line + 1].len();
-            let new_col = col_in_line.min(next_line_len);
-            let mut new_pos = 0;
-            for (i, line) in lines.iter().enumerate() {
-                if i == current_line + 1 {
-                    new_pos += new_col;
-                    break;
-                }
-                new_pos += line.len() + 1;
-            }
-            self.cursor_position = new_pos;
-            cx.notify();
-        }
+        self.clear_selection();
+        self.move_down_internal();
+        cx.notify();
     }
 
     fn handle_save(&mut self, _: &Save, _: &mut Window, _cx: &mut Context<Self>) {
@@ -176,6 +177,127 @@ impl TextEditor {
     fn handle_quit(&mut self, _: &Quit, _: &mut Window, cx: &mut Context<Self>) {
         cx.quit();
     }
+
+    fn handle_copy(&mut self, _: &Copy, _: &mut Window, cx: &mut Context<Self>) {
+        if let Some(text) = self.get_selected_text() {
+            cx.write_to_clipboard(ClipboardItem::new_string(text));
+        }
+    }
+
+    fn handle_paste(&mut self, _: &Paste, _: &mut Window, cx: &mut Context<Self>) {
+        if let Some(clipboard_item) = cx.read_from_clipboard() {
+            if let Some(text) = clipboard_item.text().map(|s| s.to_string()) {
+                self.delete_selection();
+                self.content.insert_str(self.cursor_position, &text);
+                self.cursor_position += text.len();
+                cx.notify();
+            }
+        }
+    }
+
+    fn handle_cut(&mut self, _: &Cut, _: &mut Window, cx: &mut Context<Self>) {
+        if let Some(text) = self.get_selected_text() {
+            cx.write_to_clipboard(ClipboardItem::new_string(text));
+            self.delete_selection();
+            cx.notify();
+        }
+    }
+
+    fn handle_select_left(&mut self, _: &SelectLeft, _: &mut Window, cx: &mut Context<Self>) {
+        if self.selection_start.is_none() {
+            self.selection_start = Some(self.cursor_position);
+        }
+        if self.cursor_position > 0 {
+            self.cursor_position -= 1;
+            cx.notify();
+        }
+    }
+
+    fn handle_select_right(&mut self, _: &SelectRight, _: &mut Window, cx: &mut Context<Self>) {
+        if self.selection_start.is_none() {
+            self.selection_start = Some(self.cursor_position);
+        }
+        if self.cursor_position < self.content.len() {
+            self.cursor_position += 1;
+            cx.notify();
+        }
+    }
+
+    fn handle_select_up(&mut self, _: &SelectUp, _: &mut Window, cx: &mut Context<Self>) {
+        if self.selection_start.is_none() {
+            self.selection_start = Some(self.cursor_position);
+        }
+        self.move_up_internal();
+        cx.notify();
+    }
+
+    fn handle_select_down(&mut self, _: &SelectDown, _: &mut Window, cx: &mut Context<Self>) {
+        if self.selection_start.is_none() {
+            self.selection_start = Some(self.cursor_position);
+        }
+        self.move_down_internal();
+        cx.notify();
+    }
+
+    fn move_up_internal(&mut self) {
+        let lines: Vec<&str> = self.content.split('\n').collect();
+        let mut current_pos = 0;
+        let mut current_line = 0;
+        let mut col_in_line = 0;
+
+        for (line_idx, line) in lines.iter().enumerate() {
+            if current_pos + line.len() >= self.cursor_position {
+                current_line = line_idx;
+                col_in_line = self.cursor_position - current_pos;
+                break;
+            }
+            current_pos += line.len() + 1;
+        }
+
+        if current_line > 0 {
+            let prev_line_len = lines[current_line - 1].len();
+            let new_col = col_in_line.min(prev_line_len);
+            let mut new_pos = 0;
+            for (i, line) in lines.iter().enumerate() {
+                if i == current_line - 1 {
+                    new_pos += new_col;
+                    break;
+                }
+                new_pos += line.len() + 1;
+            }
+            self.cursor_position = new_pos;
+        }
+    }
+
+    fn move_down_internal(&mut self) {
+        let lines: Vec<&str> = self.content.split('\n').collect();
+        let mut current_pos = 0;
+        let mut current_line = 0;
+        let mut col_in_line = 0;
+
+        for (line_idx, line) in lines.iter().enumerate() {
+            if current_pos + line.len() >= self.cursor_position {
+                current_line = line_idx;
+                col_in_line = self.cursor_position - current_pos;
+                break;
+            }
+            current_pos += line.len() + 1;
+        }
+
+        if current_line < lines.len() - 1 {
+            let next_line_len = lines[current_line + 1].len();
+            let new_col = col_in_line.min(next_line_len);
+            let mut new_pos = 0;
+            for (i, line) in lines.iter().enumerate() {
+                if i == current_line + 1 {
+                    new_pos += new_col;
+                    break;
+                }
+                new_pos += line.len() + 1;
+            }
+            self.cursor_position = new_pos;
+        }
+    }
 }
 
 impl Focusable for TextEditor {
@@ -196,6 +318,13 @@ impl Render for TextEditor {
             .on_action(cx.listener(Self::handle_enter))
             .on_action(cx.listener(Self::handle_save))
             .on_action(cx.listener(Self::handle_quit))
+            .on_action(cx.listener(Self::handle_copy))
+            .on_action(cx.listener(Self::handle_paste))
+            .on_action(cx.listener(Self::handle_cut))
+            .on_action(cx.listener(Self::handle_select_left))
+            .on_action(cx.listener(Self::handle_select_right))
+            .on_action(cx.listener(Self::handle_select_up))
+            .on_action(cx.listener(Self::handle_select_down))
             .on_key_down(cx.listener(|editor, event: &KeyDownEvent, _, cx| {
                 if let Some(key_char) = &event.keystroke.key_char {
                     if key_char.len() == 1
@@ -230,6 +359,7 @@ impl Render for TextEditor {
                 let lines: Vec<&str> = self.content.split('\n').collect();
                 let mut current_pos = 0;
                 let mut result = div().flex().flex_col();
+                let selection_range = self.get_selection_range();
 
                 for line in lines {
                     let line_start = current_pos;
@@ -244,16 +374,44 @@ impl Render for TextEditor {
 
                     for (text, token_type) in tokens {
                         let token_color = MarkdownHighlighter::get_color(&token_type);
-                        let token_start = char_count;
-                        let token_end = char_count + text.len();
+                        let token_start = line_start + char_count;
+                        let token_end = token_start + text.len();
 
-                        if cursor_on_line {
-                            let cursor_col = self.cursor_position - line_start;
+                        let cursor_in_token = cursor_on_line
+                            && self.cursor_position >= token_start
+                            && self.cursor_position < token_end;
 
-                            if cursor_col >= token_start && cursor_col < token_end {
-                                let col_in_token = cursor_col - token_start;
-                                let before = &text[..col_in_token];
-                                let after = &text[col_in_token..];
+                        if let Some((sel_start, sel_end)) = selection_range {
+                            if token_end > sel_start && token_start < sel_end {
+                                let overlap_start = sel_start.max(token_start) - token_start;
+                                let overlap_end = sel_end.min(token_end) - token_start;
+
+                                let before_sel = &text[..overlap_start];
+                                let selected = &text[overlap_start..overlap_end];
+                                let after_sel = &text[overlap_end..];
+
+                                if !before_sel.is_empty() {
+                                    line_div = line_div.child(
+                                        div().text_color(token_color).child(before_sel.to_string()),
+                                    );
+                                }
+                                if !selected.is_empty() {
+                                    line_div = line_div.child(
+                                        div()
+                                            .bg(rgb(0x264F78))
+                                            .text_color(rgb(0xffffff))
+                                            .child(selected.to_string()),
+                                    );
+                                }
+                                if !after_sel.is_empty() {
+                                    line_div = line_div.child(
+                                        div().text_color(token_color).child(after_sel.to_string()),
+                                    );
+                                }
+                            } else if cursor_in_token {
+                                let cursor_offset = self.cursor_position - token_start;
+                                let before = &text[..cursor_offset];
+                                let after = &text[cursor_offset..];
 
                                 if !before.is_empty() {
                                     line_div = line_div.child(
@@ -267,16 +425,24 @@ impl Render for TextEditor {
                                         div().text_color(token_color).child(after.to_string()),
                                     );
                                 }
-                            } else if cursor_col == token_end && token_end == line.len() {
-                                line_div = line_div
-                                    .child(div().text_color(token_color).child(text.clone()));
-                                if char_count + text.len() == line.len() {
-                                    line_div = line_div
-                                        .child(div().w(px(4.0)).h(px(18.0)).bg(rgb(0xcccccc)));
-                                }
                             } else {
                                 line_div = line_div
                                     .child(div().text_color(token_color).child(text.clone()));
+                            }
+                        } else if cursor_in_token {
+                            let cursor_offset = self.cursor_position - token_start;
+                            let before = &text[..cursor_offset];
+                            let after = &text[cursor_offset..];
+
+                            if !before.is_empty() {
+                                line_div = line_div
+                                    .child(div().text_color(token_color).child(before.to_string()));
+                            }
+                            line_div =
+                                line_div.child(div().w(px(4.0)).h(px(18.0)).bg(rgb(0xcccccc)));
+                            if !after.is_empty() {
+                                line_div = line_div
+                                    .child(div().text_color(token_color).child(after.to_string()));
                             }
                         } else {
                             line_div =
@@ -284,6 +450,14 @@ impl Render for TextEditor {
                         }
 
                         char_count += text.len();
+                    }
+
+                    if cursor_on_line {
+                        let cursor_col = self.cursor_position - line_start;
+                        if cursor_col == line.len() {
+                            line_div =
+                                line_div.child(div().w(px(4.0)).h(px(18.0)).bg(rgb(0xcccccc)));
+                        }
                     }
 
                     result = result.child(line_div);
