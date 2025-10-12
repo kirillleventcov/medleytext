@@ -1,3 +1,9 @@
+//! Text editor component with markdown syntax highlighting.
+//!
+//! This module provides the core `TextEditor` struct and its associated
+//! functionality including cursor management, text selection, clipboard operations,
+//! scrolling, and rendering with real-time markdown syntax highlighting.
+
 use gpui::{
     App, ClipboardItem, Context, FocusHandle, Focusable, KeyDownEvent, MouseDownEvent, Render,
     ScrollWheelEvent, Window, actions, div, prelude::*, px, rgb,
@@ -5,6 +11,8 @@ use gpui::{
 
 use crate::markdown::MarkdownHighlighter;
 
+/// Define GPUI actions for keyboard shortcuts and user commands.
+/// These actions are bound to keys in main.rs and handled by the TextEditor.
 actions!(
     editor,
     [
@@ -27,16 +35,63 @@ actions!(
     ]
 );
 
+/// Core text editor component.
+///
+/// Manages document state, cursor position, text selection, file I/O, and rendering.
+/// All text is stored as UTF-8 in a single `String`, with positions tracked as byte offsets.
+///
+/// # Architecture Notes
+///
+/// - **Cursor Position**: Byte offset into `content` string (not character index)
+/// - **Selection Model**: Anchor-based selection with `selection_start` and `cursor_position` endpoints
+/// - **Scrolling**: Pixel-based vertical scroll offset, clamped to content bounds
+/// - **Rendering**: Token-based rendering with per-token color application from markdown highlighter
+///
+/// # Future Improvements
+///
+/// - Replace `String` with rope data structure for better performance on large files
+/// - Add undo/redo stack
+/// - Implement multi-cursor support
+/// - Add line numbers in gutter
+/// - Consider caching tokenized lines for better rendering performance
 pub struct TextEditor {
+    /// Full document content as UTF-8 string. Consider rope data structure for large files.
     content: String,
+
+    /// Byte offset of cursor position in `content`. Use byte index, not char index.
     cursor_position: usize,
+
+    /// Anchor point for text selection. When `Some`, a selection exists between this and `cursor_position`.
     selection_start: Option<usize>,
+
+    /// GPUI focus handle for keyboard event routing.
     focus_handle: FocusHandle,
+
+    /// Path to currently opened file. `None` indicates unsaved buffer.
     current_file: Option<String>,
+
+    /// Vertical scroll position in pixels. Clamped to [0, max_content_height - viewport_height].
     scroll_offset: f32,
 }
 
 impl TextEditor {
+    /// Creates a new TextEditor instance, optionally loading content from a file.
+    ///
+    /// # Arguments
+    ///
+    /// * `file_path` - Optional path to file to load. If `None`, starts with welcome message.
+    /// * `cx` - GPUI context for initialization.
+    ///
+    /// # Behavior
+    ///
+    /// - If file exists: loads content and stores path
+    /// - If file doesn't exist: creates empty buffer but remembers path for save operation
+    /// - If no path provided: shows welcome message with no associated file
+    ///
+    /// # Error Handling
+    ///
+    /// File read errors are logged to stderr but don't prevent editor initialization.
+    /// This allows creating new files or recovering from read permission issues.
     pub fn with_file(file_path: Option<String>, cx: &mut Context<Self>) -> Self {
         let (content, current_file) = if let Some(path) = file_path {
             match std::fs::read_to_string(&path) {
@@ -66,6 +121,12 @@ impl TextEditor {
         }
     }
 
+    /// Returns the normalized selection range as (start, end) byte offsets.
+    ///
+    /// Selection is always normalized so that start < end, regardless of
+    /// the direction the selection was made (forward or backward).
+    ///
+    /// Returns `None` if no selection is active.
     fn get_selection_range(&self) -> Option<(usize, usize)> {
         self.selection_start.map(|start| {
             if start < self.cursor_position {
@@ -76,15 +137,33 @@ impl TextEditor {
         })
     }
 
+    /// Extracts the currently selected text as a string.
+    ///
+    /// Returns `None` if no selection is active.
+    /// Used for copy and cut operations.
     fn get_selected_text(&self) -> Option<String> {
         self.get_selection_range()
             .map(|(start, end)| self.content[start..end].to_string())
     }
 
+    /// Clears the active selection without modifying content.
+    ///
+    /// Called after cursor movements that should deselect (arrow keys without shift).
     fn clear_selection(&mut self) {
         self.selection_start = None;
     }
 
+    /// Deletes the selected text and clears the selection.
+    ///
+    /// # Returns
+    ///
+    /// `true` if text was deleted, `false` if no selection was active.
+    ///
+    /// # Side Effects
+    ///
+    /// - Removes selected bytes from `content`
+    /// - Moves cursor to start of deleted range
+    /// - Clears selection state
     fn delete_selection(&mut self) -> bool {
         if let Some((start, end)) = self.get_selection_range() {
             self.content.drain(start..end);
@@ -96,6 +175,15 @@ impl TextEditor {
         }
     }
 
+    /// Inserts a single character at the cursor position.
+    ///
+    /// If a selection is active, it's deleted first (standard text editor behavior).
+    /// Advances cursor position by the UTF-8 byte length of the character.
+    ///
+    /// # Arguments
+    ///
+    /// * `c` - Character to insert
+    /// * `cx` - Context for triggering UI refresh via `notify()`
     fn insert_char(&mut self, c: char, cx: &mut Context<Self>) {
         self.delete_selection();
         self.content.insert(self.cursor_position, c);
@@ -103,6 +191,12 @@ impl TextEditor {
         cx.notify();
     }
 
+    /// Handles backspace key press.
+    ///
+    /// Behavior:
+    /// - If selection exists: delete selected text
+    /// - Otherwise: delete character before cursor
+    /// - Does nothing if cursor is at document start
     fn handle_backspace(&mut self, _: &Backspace, _: &mut Window, cx: &mut Context<Self>) {
         if !self.delete_selection() {
             if self.cursor_position > 0 {
@@ -113,12 +207,15 @@ impl TextEditor {
         cx.notify();
     }
 
+    /// Handles Enter key press by inserting a newline at cursor position.
     fn handle_enter(&mut self, _: &Enter, _: &mut Window, cx: &mut Context<Self>) {
         self.content.insert(self.cursor_position, '\n');
         self.cursor_position += 1;
         cx.notify();
     }
 
+    /// Moves cursor left by one character.
+    /// Clears any active selection (standard non-shift arrow key behavior).
     fn handle_move_left(&mut self, _: &MoveLeft, _: &mut Window, cx: &mut Context<Self>) {
         self.clear_selection();
         if self.cursor_position > 0 {
@@ -127,6 +224,8 @@ impl TextEditor {
         }
     }
 
+    /// Moves cursor right by one character.
+    /// Clears any active selection (standard non-shift arrow key behavior).
     fn handle_move_right(&mut self, _: &MoveRight, _: &mut Window, cx: &mut Context<Self>) {
         self.clear_selection();
         if self.cursor_position < self.content.len() {
@@ -135,18 +234,33 @@ impl TextEditor {
         }
     }
 
+    /// Moves cursor up one line, maintaining horizontal column position when possible.
+    /// Clears any active selection.
     fn handle_move_up(&mut self, _: &MoveUp, _: &mut Window, cx: &mut Context<Self>) {
         self.clear_selection();
         self.move_up_internal();
         cx.notify();
     }
 
+    /// Moves cursor down one line, maintaining horizontal column position when possible.
+    /// Clears any active selection.
     fn handle_move_down(&mut self, _: &MoveDown, _: &mut Window, cx: &mut Context<Self>) {
         self.clear_selection();
         self.move_down_internal();
         cx.notify();
     }
 
+    /// Handles Ctrl+S (Save) action.
+    ///
+    /// Behavior:
+    /// - If `current_file` is set: writes content to that path
+    /// - Otherwise: prompts for file path via stdin (blocking)
+    ///
+    /// # Limitations
+    ///
+    /// - Stdin prompt is blocking and non-ideal for GUI application
+    /// - Consider implementing modal dialog for file path input
+    /// - No dirty flag tracking or save confirmation yet
     fn handle_save(&mut self, _: &Save, _: &mut Window, _cx: &mut Context<Self>) {
         use std::io::{self, Write};
 
@@ -177,16 +291,25 @@ impl TextEditor {
         }
     }
 
+    /// Handles Ctrl+Q (Quit) action by terminating the application.
     fn handle_quit(&mut self, _: &Quit, _: &mut Window, cx: &mut Context<Self>) {
         cx.quit();
     }
 
+    /// Handles Ctrl+C (Copy) action.
+    /// Copies selected text to system clipboard. Does nothing if no selection.
     fn handle_copy(&mut self, _: &Copy, _: &mut Window, cx: &mut Context<Self>) {
         if let Some(text) = self.get_selected_text() {
             cx.write_to_clipboard(ClipboardItem::new_string(text));
         }
     }
 
+    /// Handles Ctrl+V (Paste) action.
+    ///
+    /// Behavior:
+    /// - If selection exists: replace selected text with clipboard content
+    /// - Otherwise: insert clipboard content at cursor
+    /// - Advances cursor to end of pasted text
     fn handle_paste(&mut self, _: &Paste, _: &mut Window, cx: &mut Context<Self>) {
         if let Some(clipboard_item) = cx.read_from_clipboard() {
             if let Some(text) = clipboard_item.text().map(|s| s.to_string()) {
@@ -198,6 +321,8 @@ impl TextEditor {
         }
     }
 
+    /// Handles Ctrl+X (Cut) action.
+    /// Copies selected text to clipboard and deletes it. Does nothing if no selection.
     fn handle_cut(&mut self, _: &Cut, _: &mut Window, cx: &mut Context<Self>) {
         if let Some(text) = self.get_selected_text() {
             cx.write_to_clipboard(ClipboardItem::new_string(text));
@@ -206,6 +331,8 @@ impl TextEditor {
         }
     }
 
+    /// Handles Shift+Left (Select Left) action.
+    /// Extends or initiates selection while moving cursor left.
     fn handle_select_left(&mut self, _: &SelectLeft, _: &mut Window, cx: &mut Context<Self>) {
         if self.selection_start.is_none() {
             self.selection_start = Some(self.cursor_position);
@@ -216,6 +343,8 @@ impl TextEditor {
         }
     }
 
+    /// Handles Shift+Right (Select Right) action.
+    /// Extends or initiates selection while moving cursor right.
     fn handle_select_right(&mut self, _: &SelectRight, _: &mut Window, cx: &mut Context<Self>) {
         if self.selection_start.is_none() {
             self.selection_start = Some(self.cursor_position);
@@ -226,6 +355,8 @@ impl TextEditor {
         }
     }
 
+    /// Handles Shift+Up (Select Up) action.
+    /// Extends or initiates selection while moving cursor up one line.
     fn handle_select_up(&mut self, _: &SelectUp, _: &mut Window, cx: &mut Context<Self>) {
         if self.selection_start.is_none() {
             self.selection_start = Some(self.cursor_position);
@@ -234,6 +365,8 @@ impl TextEditor {
         cx.notify();
     }
 
+    /// Handles Shift+Down (Select Down) action.
+    /// Extends or initiates selection while moving cursor down one line.
     fn handle_select_down(&mut self, _: &SelectDown, _: &mut Window, cx: &mut Context<Self>) {
         if self.selection_start.is_none() {
             self.selection_start = Some(self.cursor_position);
@@ -242,12 +375,28 @@ impl TextEditor {
         cx.notify();
     }
 
+    /// Handles Ctrl+A (Select All) action.
+    /// Selects entire document content.
     fn handle_select_all(&mut self, _: &SelectAll, _: &mut Window, cx: &mut Context<Self>) {
         self.selection_start = Some(0);
         self.cursor_position = self.content.len();
         cx.notify();
     }
 
+    /// Handles mouse click events for cursor positioning.
+    ///
+    /// Converts pixel coordinates to document position by:
+    /// 1. Calculating clicked line from Y coordinate
+    /// 2. Calculating column from X coordinate
+    /// 3. Converting (line, column) to byte offset
+    ///
+    /// # Magic Numbers
+    ///
+    /// Hardcoded layout constants should be extracted to `TextEditor` constants:
+    /// - `char_width`: 7.2px (assumes monospace font)
+    /// - `line_height`: 22px
+    /// - `header_height`: 30px (status bar)
+    /// - `padding`: 16px
     fn handle_mouse_down(&mut self, event: &MouseDownEvent, cx: &mut Context<Self>) {
         self.clear_selection();
 
@@ -281,6 +430,15 @@ impl TextEditor {
         cx.notify();
     }
 
+    /// Handles mouse scroll wheel events for vertical scrolling.
+    ///
+    /// Supports both pixel-based and line-based scroll deltas.
+    /// Clamps scroll offset to valid range [0, max_content_height - viewport_height].
+    ///
+    /// # Magic Numbers
+    ///
+    /// - `line_height`: 22.0px (should match rendering constant)
+    /// - `viewport_height`: 538.0px (derived from window height - header - padding)
     fn handle_scroll_wheel(&mut self, event: &ScrollWheelEvent, cx: &mut Context<Self>) {
         let line_height = 22.0;
 
@@ -302,6 +460,15 @@ impl TextEditor {
         cx.notify();
     }
 
+    /// Internal helper for moving cursor up one line while preserving column position.
+    ///
+    /// Algorithm:
+    /// 1. Find current line and column position
+    /// 2. Move to previous line
+    /// 3. Clamp column to line length (handles lines of different lengths)
+    /// 4. Convert (line, column) back to byte offset
+    ///
+    /// This logic is shared by `handle_move_up` and `handle_select_up`.
     fn move_up_internal(&mut self) {
         let lines: Vec<&str> = self.content.split('\n').collect();
         let mut current_pos = 0;
@@ -332,6 +499,10 @@ impl TextEditor {
         }
     }
 
+    /// Internal helper for moving cursor down one line while preserving column position.
+    ///
+    /// Algorithm mirrors `move_up_internal` but moves to the next line instead.
+    /// Handles edge cases like moving from long line to short line gracefully.
     fn move_down_internal(&mut self) {
         let lines: Vec<&str> = self.content.split('\n').collect();
         let mut current_pos = 0;
@@ -363,12 +534,34 @@ impl TextEditor {
     }
 }
 
+/// GPUI Focusable trait implementation for keyboard event routing.
 impl Focusable for TextEditor {
     fn focus_handle(&self, _: &App) -> FocusHandle {
         self.focus_handle.clone()
     }
 }
 
+/// GPUI Render trait implementation for UI rendering.
+///
+/// This is the core rendering logic that:
+/// 1. Splits content into lines
+/// 2. Tokenizes each line for markdown syntax
+/// 3. Applies colors per token type
+/// 4. Renders cursor and selection overlays
+/// 5. Handles scrolling via transform offset
+///
+/// # Performance Considerations
+///
+/// - Tokenizes all visible lines on every render
+/// - Consider caching tokenized lines if performance becomes an issue
+/// - Selection rendering splits tokens that cross selection boundaries
+///
+/// # Rendering Architecture
+///
+/// - Uses GPUI's flexbox-based layout system
+/// - Cursor is rendered as a 4px wide colored div
+/// - Selection uses background color overlay
+/// - Text is rendered in monospace font for consistent character width
 impl Render for TextEditor {
     fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         div()

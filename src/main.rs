@@ -1,3 +1,8 @@
+//! MedleyText - A markdown-first text editor built with GPUI.
+//!
+//! This is the main entry point for the application. It handles initialization,
+//! key binding configuration, and window creation.
+
 mod editor;
 mod markdown;
 
@@ -6,6 +11,21 @@ use gpui::{
     App, AppContext, Application, Bounds, KeyBinding, WindowBounds, WindowOptions, px, size,
 };
 
+/// Application entry point.
+///
+/// Accepts an optional file path as the first command-line argument.
+/// If provided, the file will be loaded into the editor on startup.
+/// If the file doesn't exist, a new empty buffer with that filename is created.
+///
+/// # Examples
+///
+/// ```bash
+/// # Open existing file
+/// medleytext document.md
+///
+/// # Start with empty buffer
+/// medleytext
+/// ```
 fn main() {
     let args: Vec<String> = std::env::args().collect();
     let file_path = args.get(1).cloned();
@@ -16,6 +36,9 @@ fn main() {
             SelectAll, SelectDown, SelectLeft, SelectRight, SelectUp,
         };
 
+        // Configure global keybindings for the application.
+        // These bindings are active whenever the TextEditor has focus.
+        // Uses standard editor conventions (arrow keys, Ctrl+S, etc.)
         cx.bind_keys([
             KeyBinding::new("left", MoveLeft, None),
             KeyBinding::new("right", MoveRight, None),
@@ -35,6 +58,8 @@ fn main() {
             KeyBinding::new("ctrl-a", SelectAll, None),
         ]);
 
+        // Create a centered window with fixed dimensions (800x600).
+        // Consider making window size configurable via config file in future iterations.
         let bounds = Bounds::centered(None, size(px(800.0), px(600.0)), cx);
         let file_path_clone = file_path.clone();
         cx.open_window(
