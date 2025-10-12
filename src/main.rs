@@ -13,7 +13,7 @@ fn main() {
     Application::new().run(move |cx: &mut App| {
         use editor::{
             Backspace, Copy, Cut, Enter, MoveDown, MoveLeft, MoveRight, MoveUp, Paste, Quit, Save,
-            SelectDown, SelectLeft, SelectRight, SelectUp,
+            SelectAll, SelectDown, SelectLeft, SelectRight, SelectUp,
         };
 
         cx.bind_keys([
@@ -32,6 +32,7 @@ fn main() {
             KeyBinding::new("shift-right", SelectRight, None),
             KeyBinding::new("shift-up", SelectUp, None),
             KeyBinding::new("shift-down", SelectDown, None),
+            KeyBinding::new("ctrl-a", SelectAll, None),
         ]);
 
         let bounds = Bounds::centered(None, size(px(800.0), px(600.0)), cx);

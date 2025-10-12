@@ -22,7 +22,8 @@ actions!(
         SelectLeft,
         SelectRight,
         SelectUp,
-        SelectDown
+        SelectDown,
+        SelectAll,
     ]
 );
 
@@ -239,6 +240,12 @@ impl TextEditor {
         cx.notify();
     }
 
+    fn handle_select_all(&mut self, _: &SelectAll, _: &mut Window, cx: &mut Context<Self>) {
+        self.selection_start = Some(0);
+        self.cursor_position = self.content.len();
+        cx.notify();
+    }
+
     fn move_up_internal(&mut self) {
         let lines: Vec<&str> = self.content.split('\n').collect();
         let mut current_pos = 0;
@@ -325,6 +332,7 @@ impl Render for TextEditor {
             .on_action(cx.listener(Self::handle_select_right))
             .on_action(cx.listener(Self::handle_select_up))
             .on_action(cx.listener(Self::handle_select_down))
+            .on_action(cx.listener(Self::handle_select_all))
             .on_key_down(cx.listener(|editor, event: &KeyDownEvent, _, cx| {
                 if let Some(key_char) = &event.keystroke.key_char {
                     if key_char.len() == 1
