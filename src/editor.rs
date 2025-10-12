@@ -1,6 +1,6 @@
 use gpui::{
-    App, ClipboardItem, Context, FocusHandle, Focusable, KeyDownEvent, Render, Window, actions,
-    div, prelude::*, px, rgb,
+    App, ClipboardItem, Context, FocusHandle, Focusable, KeyDownEvent, MouseDownEvent, Render,
+    ScrollWheelEvent, Window, actions, div, prelude::*, px, rgb,
 };
 
 use crate::markdown::MarkdownHighlighter;
@@ -33,6 +33,7 @@ pub struct TextEditor {
     selection_start: Option<usize>,
     focus_handle: FocusHandle,
     current_file: Option<String>,
+    scroll_offset: f32,
 }
 
 impl TextEditor {
@@ -61,6 +62,7 @@ impl TextEditor {
             selection_start: None,
             focus_handle: cx.focus_handle(),
             current_file,
+            scroll_offset: 0.0,
         }
     }
 
@@ -246,6 +248,60 @@ impl TextEditor {
         cx.notify();
     }
 
+    fn handle_mouse_down(&mut self, event: &MouseDownEvent, cx: &mut Context<Self>) {
+        self.clear_selection();
+
+        let char_width = px(7.2);
+        let line_height = px(22.0);
+        let header_height = px(30.0);
+        let padding = px(16.0);
+
+        let click_x = event.position.x - padding;
+        let click_y = event.position.y - padding - header_height + px(self.scroll_offset);
+
+        let clicked_line = ((click_y / line_height).max(0.0).floor() as usize).max(0);
+
+        let clicked_col = ((click_x / char_width).max(0.0).round() as usize).max(0);
+
+        let lines: Vec<&str> = self.content.split('\n').collect();
+
+        let target_line = clicked_line.min(lines.len().saturating_sub(1));
+
+        let mut byte_position = 0;
+        for (idx, line) in lines.iter().enumerate() {
+            if idx == target_line {
+                let target_col = clicked_col.min(line.len());
+                byte_position += target_col;
+                break;
+            }
+            byte_position += line.len() + 1;
+        }
+
+        self.cursor_position = byte_position;
+        cx.notify();
+    }
+
+    fn handle_scroll_wheel(&mut self, event: &ScrollWheelEvent, cx: &mut Context<Self>) {
+        let line_height = 22.0;
+
+        let scroll_amount = match event.delta {
+            gpui::ScrollDelta::Pixels(delta) => delta.y.into(),
+            gpui::ScrollDelta::Lines(delta) => delta.y * line_height,
+        };
+
+        self.scroll_offset -= scroll_amount;
+
+        let lines: Vec<&str> = self.content.split('\n').collect();
+        let total_content_height = lines.len() as f32 * line_height;
+
+        let viewport_height = 538.0;
+        let max_scroll = (total_content_height - viewport_height).max(0.0);
+
+        self.scroll_offset = self.scroll_offset.clamp(0.0, max_scroll);
+
+        cx.notify();
+    }
+
     fn move_up_internal(&mut self) {
         let lines: Vec<&str> = self.content.split('\n').collect();
         let mut current_pos = 0;
@@ -317,6 +373,15 @@ impl Render for TextEditor {
     fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         div()
             .track_focus(&self.focus_handle(cx))
+            .on_mouse_down(
+                gpui::MouseButton::Left,
+                cx.listener(|editor, event: &MouseDownEvent, _, cx| {
+                    editor.handle_mouse_down(event, cx);
+                }),
+            )
+            .on_scroll_wheel(cx.listener(|editor, event: &ScrollWheelEvent, _, cx| {
+                editor.handle_scroll_wheel(event, cx);
+            }))
             .on_action(cx.listener(Self::handle_move_left))
             .on_action(cx.listener(Self::handle_move_right))
             .on_action(cx.listener(Self::handle_move_up))
@@ -363,58 +428,84 @@ impl Render for TextEditor {
                             .map(|p| p.as_str())
                             .unwrap_or("[unsaved]")
                     )))
-            .child(div().flex().flex_col().gap_1().child({
-                let lines: Vec<&str> = self.content.split('\n').collect();
-                let mut current_pos = 0;
-                let mut result = div().flex().flex_col();
-                let selection_range = self.get_selection_range();
+            .child(div().flex().flex_col().gap_1().overflow_hidden().child(
+                div().flex().flex_col().mt(px(-self.scroll_offset)).child({
+                    let lines: Vec<&str> = self.content.split('\n').collect();
+                    let mut current_pos = 0;
+                    let mut result = div().flex().flex_col();
+                    let selection_range = self.get_selection_range();
 
-                for line in lines {
-                    let line_start = current_pos;
-                    let line_end = current_pos + line.len();
-                    let cursor_on_line =
-                        self.cursor_position >= line_start && self.cursor_position <= line_end;
+                    for line in lines {
+                        let line_start = current_pos;
+                        let line_end = current_pos + line.len();
+                        let cursor_on_line =
+                            self.cursor_position >= line_start && self.cursor_position <= line_end;
 
-                    let tokens = MarkdownHighlighter::tokenize_line(line);
+                        let tokens = MarkdownHighlighter::tokenize_line(line);
 
-                    let mut line_div = div().flex().flex_row();
-                    let mut char_count = 0;
+                        let mut line_div = div().flex().flex_row();
+                        let mut char_count = 0;
 
-                    for (text, token_type) in tokens {
-                        let token_color = MarkdownHighlighter::get_color(&token_type);
-                        let token_start = line_start + char_count;
-                        let token_end = token_start + text.len();
+                        for (text, token_type) in tokens {
+                            let token_color = MarkdownHighlighter::get_color(&token_type);
+                            let token_start = line_start + char_count;
+                            let token_end = token_start + text.len();
 
-                        let cursor_in_token = cursor_on_line
-                            && self.cursor_position >= token_start
-                            && self.cursor_position < token_end;
+                            let cursor_in_token = cursor_on_line
+                                && self.cursor_position >= token_start
+                                && self.cursor_position < token_end;
 
-                        if let Some((sel_start, sel_end)) = selection_range {
-                            if token_end > sel_start && token_start < sel_end {
-                                let overlap_start = sel_start.max(token_start) - token_start;
-                                let overlap_end = sel_end.min(token_end) - token_start;
+                            if let Some((sel_start, sel_end)) = selection_range {
+                                if token_end > sel_start && token_start < sel_end {
+                                    let overlap_start = sel_start.max(token_start) - token_start;
+                                    let overlap_end = sel_end.min(token_end) - token_start;
 
-                                let before_sel = &text[..overlap_start];
-                                let selected = &text[overlap_start..overlap_end];
-                                let after_sel = &text[overlap_end..];
+                                    let before_sel = &text[..overlap_start];
+                                    let selected = &text[overlap_start..overlap_end];
+                                    let after_sel = &text[overlap_end..];
 
-                                if !before_sel.is_empty() {
-                                    line_div = line_div.child(
-                                        div().text_color(token_color).child(before_sel.to_string()),
-                                    );
-                                }
-                                if !selected.is_empty() {
-                                    line_div = line_div.child(
-                                        div()
-                                            .bg(rgb(0x264F78))
-                                            .text_color(rgb(0xffffff))
-                                            .child(selected.to_string()),
-                                    );
-                                }
-                                if !after_sel.is_empty() {
-                                    line_div = line_div.child(
-                                        div().text_color(token_color).child(after_sel.to_string()),
-                                    );
+                                    if !before_sel.is_empty() {
+                                        line_div = line_div.child(
+                                            div()
+                                                .text_color(token_color)
+                                                .child(before_sel.to_string()),
+                                        );
+                                    }
+                                    if !selected.is_empty() {
+                                        line_div = line_div.child(
+                                            div()
+                                                .bg(rgb(0x264F78))
+                                                .text_color(rgb(0xffffff))
+                                                .child(selected.to_string()),
+                                        );
+                                    }
+                                    if !after_sel.is_empty() {
+                                        line_div = line_div.child(
+                                            div()
+                                                .text_color(token_color)
+                                                .child(after_sel.to_string()),
+                                        );
+                                    }
+                                } else if cursor_in_token {
+                                    let cursor_offset = self.cursor_position - token_start;
+                                    let before = &text[..cursor_offset];
+                                    let after = &text[cursor_offset..];
+
+                                    if !before.is_empty() {
+                                        line_div = line_div.child(
+                                            div().text_color(token_color).child(before.to_string()),
+                                        );
+                                    }
+                                    line_div = line_div
+                                        .child(div().w(px(4.0)).h(px(18.0)).bg(rgb(0xcccccc)));
+                                    if !after.is_empty() {
+                                        line_div = line_div.child(
+                                            div().text_color(token_color).child(after.to_string()),
+                                        );
+                                    }
+                                } else {
+                                    line_div = line_div
+                                        .child(div().text_color(token_color).child(text.clone()));
                                 }
                             } else if cursor_in_token {
                                 let cursor_offset = self.cursor_position - token_start;
@@ -437,42 +528,24 @@ impl Render for TextEditor {
                                 line_div = line_div
                                     .child(div().text_color(token_color).child(text.clone()));
                             }
-                        } else if cursor_in_token {
-                            let cursor_offset = self.cursor_position - token_start;
-                            let before = &text[..cursor_offset];
-                            let after = &text[cursor_offset..];
 
-                            if !before.is_empty() {
-                                line_div = line_div
-                                    .child(div().text_color(token_color).child(before.to_string()));
-                            }
-                            line_div =
-                                line_div.child(div().w(px(4.0)).h(px(18.0)).bg(rgb(0xcccccc)));
-                            if !after.is_empty() {
-                                line_div = line_div
-                                    .child(div().text_color(token_color).child(after.to_string()));
-                            }
-                        } else {
-                            line_div =
-                                line_div.child(div().text_color(token_color).child(text.clone()));
+                            char_count += text.len();
                         }
 
-                        char_count += text.len();
-                    }
-
-                    if cursor_on_line {
-                        let cursor_col = self.cursor_position - line_start;
-                        if cursor_col == line.len() {
-                            line_div =
-                                line_div.child(div().w(px(4.0)).h(px(18.0)).bg(rgb(0xcccccc)));
+                        if cursor_on_line {
+                            let cursor_col = self.cursor_position - line_start;
+                            if cursor_col == line.len() {
+                                line_div =
+                                    line_div.child(div().w(px(4.0)).h(px(18.0)).bg(rgb(0xcccccc)));
+                            }
                         }
+
+                        result = result.child(line_div);
+                        current_pos = line_end + 1;
                     }
 
-                    result = result.child(line_div);
-                    current_pos = line_end + 1;
-                }
-
-                result
-            }))
+                    result
+                }),
+            ))
     }
 }
