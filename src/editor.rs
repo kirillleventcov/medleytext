@@ -85,7 +85,7 @@ impl TextEditor {
     /// # Behavior
     ///
     /// - If file exists: loads content and stores path
-    /// - If file doesn't exist: creates empty buffer but remembers path for save operation
+    /// - If file doesn't exist: creates empty file on disk and stores path
     /// - If no path provided: shows welcome message with no associated file
     ///
     /// # Error Handling
@@ -98,6 +98,15 @@ impl TextEditor {
                 Ok(content) => {
                     println!("Loaded file: {}", path);
                     (content, Some(path))
+                }
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                    if let Err(create_err) = std::fs::write(&path, "") {
+                        eprintln!("Failed to create file: {}", create_err);
+                        (String::new(), Some(path))
+                    } else {
+                        println!("Created new file: {}", path);
+                        (String::new(), Some(path))
+                    }
                 }
                 Err(e) => {
                     eprintln!("Failed to open file: {}", e);
