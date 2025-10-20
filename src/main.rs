@@ -5,6 +5,7 @@
 
 mod editor;
 mod markdown;
+mod palette;
 
 use editor::TextEditor;
 use gpui::{
@@ -33,7 +34,7 @@ fn main() {
     Application::new().run(move |cx: &mut App| {
         use editor::{
             Backspace, Copy, Cut, Enter, MoveDown, MoveLeft, MoveRight, MoveUp, Paste, Quit, Save,
-            SelectAll, SelectDown, SelectLeft, SelectRight, SelectUp,
+            SelectAll, SelectDown, SelectLeft, SelectRight, SelectUp, TogglePalette,
         };
 
         // Configure global keybindings for the application.
@@ -56,6 +57,7 @@ fn main() {
             KeyBinding::new("shift-up", SelectUp, None),
             KeyBinding::new("shift-down", SelectDown, None),
             KeyBinding::new("ctrl-a", SelectAll, None),
+            KeyBinding::new("ctrl-p", TogglePalette, None),
         ]);
 
         // Create a centered window with fixed dimensions (800x600).

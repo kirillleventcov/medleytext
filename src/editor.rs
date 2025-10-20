@@ -10,6 +10,7 @@ use gpui::{
 };
 
 use crate::markdown::MarkdownHighlighter;
+use crate::palette::Palette;
 
 /// Define GPUI actions for keyboard shortcuts and user commands.
 /// These actions are bound to keys in main.rs and handled by the TextEditor.
@@ -32,6 +33,7 @@ actions!(
         SelectUp,
         SelectDown,
         SelectAll,
+        TogglePalette,
     ]
 );
 
@@ -72,6 +74,12 @@ pub struct TextEditor {
 
     /// Vertical scroll position in pixels. Clamped to [0, max_content_height - viewport_height].
     scroll_offset: f32,
+
+    /// Command palette for fuzzy file finding. `None` when closed.
+    palette: Option<gpui::Entity<Palette>>,
+
+    /// Working directory for file operations and palette scanning.
+    working_dir: std::path::PathBuf,
 }
 
 impl TextEditor {
@@ -120,6 +128,8 @@ impl TextEditor {
             )
         };
 
+        let working_dir = std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from("."));
+
         Self {
             content,
             cursor_position: 0,
@@ -127,6 +137,8 @@ impl TextEditor {
             focus_handle: cx.focus_handle(),
             current_file,
             scroll_offset: 0.0,
+            palette: None,
+            working_dir,
         }
     }
 
@@ -392,6 +404,48 @@ impl TextEditor {
         cx.notify();
     }
 
+    /// Handles Ctrl+P (Toggle Palette) action.
+    /// Opens or closes the command palette for fuzzy file finding.
+    fn handle_toggle_palette(
+        &mut self,
+        _: &TogglePalette,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if self.palette.is_some() {
+            // Close palette and restore focus to editor
+            self.palette = None;
+            window.focus(&self.focus_handle);
+        } else {
+            // Open palette and transfer focus to it
+            let palette_entity = cx.new(|cx| Palette::new(self.working_dir.clone(), cx));
+            window.focus(&palette_entity.read(cx).focus_handle(cx));
+            self.palette = Some(palette_entity);
+        }
+        cx.notify();
+    }
+
+    /// Loads a file into the editor.
+    ///
+    /// This method reads the file content and updates the editor state.
+    /// Called when a file is selected from the palette.
+    fn load_file(&mut self, path: std::path::PathBuf, cx: &mut Context<Self>) {
+        match std::fs::read_to_string(&path) {
+            Ok(content) => {
+                self.content = content;
+                self.cursor_position = 0;
+                self.selection_start = None;
+                self.scroll_offset = 0.0;
+                self.current_file = Some(path.to_string_lossy().to_string());
+                println!("Loaded file: {}", path.display());
+                cx.notify();
+            }
+            Err(e) => {
+                eprintln!("Failed to load file: {}", e);
+            }
+        }
+    }
+
     /// Handles mouse click events for cursor positioning.
     ///
     /// Converts pixel coordinates to document position by:
@@ -572,8 +626,27 @@ impl Focusable for TextEditor {
 /// - Selection uses background color overlay
 /// - Text is rendered in monospace font for consistent character width
 impl Render for TextEditor {
-    fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-        div()
+    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        // Check if palette wants to open a file or close
+        if let Some(palette_entity) = &self.palette {
+            let palette = palette_entity.read(cx);
+            if palette.should_open {
+                let selected_file = palette.get_selected_file();
+                drop(palette); // Release the read lock
+                if let Some(file_to_load) = selected_file {
+                    self.palette = None;
+                    window.focus(&self.focus_handle);
+                    self.load_file(file_to_load, cx);
+                }
+            } else if palette.should_close {
+                drop(palette); // Release the read lock
+                self.palette = None;
+                window.focus(&self.focus_handle);
+                cx.notify();
+            }
+        }
+
+        let editor_content = div()
             .track_focus(&self.focus_handle(cx))
             .on_mouse_down(
                 gpui::MouseButton::Left,
@@ -600,16 +673,20 @@ impl Render for TextEditor {
             .on_action(cx.listener(Self::handle_select_up))
             .on_action(cx.listener(Self::handle_select_down))
             .on_action(cx.listener(Self::handle_select_all))
+            .on_action(cx.listener(Self::handle_toggle_palette))
             .on_key_down(cx.listener(|editor, event: &KeyDownEvent, _, cx| {
-                if let Some(key_char) = &event.keystroke.key_char {
-                    if key_char.len() == 1
-                        && !event.keystroke.modifiers.control
-                        && !event.keystroke.modifiers.alt
-                        && !event.keystroke.modifiers.platform
-                    {
-                        if let Some(c) = key_char.chars().next() {
-                            if c.is_ascii_graphic() || c == ' ' {
-                                editor.insert_char(c, cx);
+                // Regular character input (only when palette is closed)
+                if editor.palette.is_none() {
+                    if let Some(key_char) = &event.keystroke.key_char {
+                        if key_char.len() == 1
+                            && !event.keystroke.modifiers.control
+                            && !event.keystroke.modifiers.alt
+                            && !event.keystroke.modifiers.platform
+                        {
+                            if let Some(c) = key_char.chars().next() {
+                                if c.is_ascii_graphic() || c == ' ' {
+                                    editor.insert_char(c, cx);
+                                }
                             }
                         }
                     }
@@ -624,7 +701,7 @@ impl Render for TextEditor {
             .font_family("monospace")
             .text_sm()
             .child(div().mb_2().text_color(rgb(0x808080)).child(format!(
-                        "MedleyText Editor - {} | Ctrl+S: save | Ctrl+Q: quit",
+                        "MedleyText - {} | Ctrl+P: files | Ctrl+S: save | Ctrl+Q: quit",
                         self.current_file
                             .as_ref()
                             .map(|p| p.as_str())
@@ -748,6 +825,16 @@ impl Render for TextEditor {
 
                     result
                 }),
-            ))
+            ));
+
+        // Wrap in a container and add palette overlay if open
+        if let Some(palette_entity) = &self.palette {
+            div()
+                .size_full()
+                .child(editor_content)
+                .child(palette_entity.clone())
+        } else {
+            div().size_full().child(editor_content)
+        }
     }
 }
