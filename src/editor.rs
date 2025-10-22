@@ -80,6 +80,9 @@ pub struct TextEditor {
 
     /// Working directory for file operations and palette scanning.
     working_dir: std::path::PathBuf,
+
+    /// Tracks if buffer has unsaved changes.
+    is_dirty: bool,
 }
 
 impl TextEditor {
@@ -139,7 +142,19 @@ impl TextEditor {
             scroll_offset: 0.0,
             palette: None,
             working_dir,
+            is_dirty: false,
         }
+    }
+
+    /// Calculates the current line number (1-indexed) based on cursor position.
+    ///
+    /// Counts newlines before the cursor to determine which line we're on.
+    fn get_current_line_number(&self) -> usize {
+        self.content[..self.cursor_position]
+            .chars()
+            .filter(|&c| c == '\n')
+            .count()
+            + 1
     }
 
     /// Returns the normalized selection range as (start, end) byte offsets.
@@ -209,6 +224,7 @@ impl TextEditor {
         self.delete_selection();
         self.content.insert(self.cursor_position, c);
         self.cursor_position += 1;
+        self.is_dirty = true;
         cx.notify();
     }
 
@@ -223,7 +239,10 @@ impl TextEditor {
             if self.cursor_position > 0 {
                 self.cursor_position -= 1;
                 self.content.remove(self.cursor_position);
+                self.is_dirty = true;
             }
+        } else {
+            self.is_dirty = true;
         }
         cx.notify();
     }
@@ -232,6 +251,7 @@ impl TextEditor {
     fn handle_enter(&mut self, _: &Enter, _: &mut Window, cx: &mut Context<Self>) {
         self.content.insert(self.cursor_position, '\n');
         self.cursor_position += 1;
+        self.is_dirty = true;
         cx.notify();
     }
 
@@ -308,6 +328,7 @@ impl TextEditor {
             eprintln!("Failed to save file: {}", e);
         } else {
             self.current_file = Some(path.clone());
+            self.is_dirty = false;
             println!("File saved to: {}", path);
         }
     }
@@ -337,6 +358,7 @@ impl TextEditor {
                 self.delete_selection();
                 self.content.insert_str(self.cursor_position, &text);
                 self.cursor_position += text.len();
+                self.is_dirty = true;
                 cx.notify();
             }
         }
@@ -348,6 +370,7 @@ impl TextEditor {
         if let Some(text) = self.get_selected_text() {
             cx.write_to_clipboard(ClipboardItem::new_string(text));
             self.delete_selection();
+            self.is_dirty = true;
             cx.notify();
         }
     }
@@ -437,6 +460,7 @@ impl TextEditor {
                 self.selection_start = None;
                 self.scroll_offset = 0.0;
                 self.current_file = Some(path.to_string_lossy().to_string());
+                self.is_dirty = false;
                 println!("Loaded file: {}", path.display());
                 cx.notify();
             }
@@ -711,62 +735,95 @@ impl Render for TextEditor {
                             .map(|p| p.as_str())
                             .unwrap_or("[unsaved]")
                     )))
-            .child(div().flex().flex_col().gap_1().overflow_hidden().child(
-                div().flex().flex_col().mt(px(-self.scroll_offset)).child({
-                    let lines: Vec<&str> = self.content.split('\n').collect();
-                    let mut current_pos = 0;
-                    let mut result = div().flex().flex_col();
-                    let selection_range = self.get_selection_range();
+            .child(
+                div()
+                    .flex()
+                    .flex_col()
+                    .gap_1()
+                    .flex_1()
+                    .overflow_hidden()
+                    .child(div().flex().flex_col().mt(px(-self.scroll_offset)).child({
+                        let lines: Vec<&str> = self.content.split('\n').collect();
+                        let mut current_pos = 0;
+                        let mut result = div().flex().flex_col();
+                        let selection_range = self.get_selection_range();
 
-                    for line in lines {
-                        let line_start = current_pos;
-                        let line_end = current_pos + line.len();
-                        let cursor_on_line =
-                            self.cursor_position >= line_start && self.cursor_position <= line_end;
+                        for line in lines {
+                            let line_start = current_pos;
+                            let line_end = current_pos + line.len();
+                            let cursor_on_line = self.cursor_position >= line_start
+                                && self.cursor_position <= line_end;
 
-                        let tokens = MarkdownHighlighter::tokenize_line(line);
+                            let tokens = MarkdownHighlighter::tokenize_line(line);
 
-                        let mut line_div = div().flex().flex_row();
-                        let mut char_count = 0;
+                            let mut line_div = div().flex().flex_row();
+                            let mut char_count = 0;
 
-                        for (text, token_type) in tokens {
-                            let token_color = MarkdownHighlighter::get_color(&token_type);
-                            let token_start = line_start + char_count;
-                            let token_end = token_start + text.len();
+                            for (text, token_type) in tokens {
+                                let token_color = MarkdownHighlighter::get_color(&token_type);
+                                let token_start = line_start + char_count;
+                                let token_end = token_start + text.len();
 
-                            let cursor_in_token = cursor_on_line
-                                && self.cursor_position >= token_start
-                                && self.cursor_position < token_end;
+                                let cursor_in_token = cursor_on_line
+                                    && self.cursor_position >= token_start
+                                    && self.cursor_position < token_end;
 
-                            if let Some((sel_start, sel_end)) = selection_range {
-                                if token_end > sel_start && token_start < sel_end {
-                                    let overlap_start = sel_start.max(token_start) - token_start;
-                                    let overlap_end = sel_end.min(token_end) - token_start;
+                                if let Some((sel_start, sel_end)) = selection_range {
+                                    if token_end > sel_start && token_start < sel_end {
+                                        let overlap_start =
+                                            sel_start.max(token_start) - token_start;
+                                        let overlap_end = sel_end.min(token_end) - token_start;
 
-                                    let before_sel = &text[..overlap_start];
-                                    let selected = &text[overlap_start..overlap_end];
-                                    let after_sel = &text[overlap_end..];
+                                        let before_sel = &text[..overlap_start];
+                                        let selected = &text[overlap_start..overlap_end];
+                                        let after_sel = &text[overlap_end..];
 
-                                    if !before_sel.is_empty() {
+                                        if !before_sel.is_empty() {
+                                            line_div = line_div.child(
+                                                div()
+                                                    .text_color(token_color)
+                                                    .child(before_sel.to_string()),
+                                            );
+                                        }
+                                        if !selected.is_empty() {
+                                            line_div = line_div.child(
+                                                div()
+                                                    .bg(rgb(0x264F78))
+                                                    .text_color(rgb(0xffffff))
+                                                    .child(selected.to_string()),
+                                            );
+                                        }
+                                        if !after_sel.is_empty() {
+                                            line_div = line_div.child(
+                                                div()
+                                                    .text_color(token_color)
+                                                    .child(after_sel.to_string()),
+                                            );
+                                        }
+                                    } else if cursor_in_token {
+                                        let cursor_offset = self.cursor_position - token_start;
+                                        let before = &text[..cursor_offset];
+                                        let after = &text[cursor_offset..];
+
+                                        if !before.is_empty() {
+                                            line_div = line_div.child(
+                                                div()
+                                                    .text_color(token_color)
+                                                    .child(before.to_string()),
+                                            );
+                                        }
+                                        line_div = line_div
+                                            .child(div().w(px(4.0)).h(px(18.0)).bg(rgb(0xcccccc)));
+                                        if !after.is_empty() {
+                                            line_div = line_div.child(
+                                                div()
+                                                    .text_color(token_color)
+                                                    .child(after.to_string()),
+                                            );
+                                        }
+                                    } else {
                                         line_div = line_div.child(
-                                            div()
-                                                .text_color(token_color)
-                                                .child(before_sel.to_string()),
-                                        );
-                                    }
-                                    if !selected.is_empty() {
-                                        line_div = line_div.child(
-                                            div()
-                                                .bg(rgb(0x264F78))
-                                                .text_color(rgb(0xffffff))
-                                                .child(selected.to_string()),
-                                        );
-                                    }
-                                    if !after_sel.is_empty() {
-                                        line_div = line_div.child(
-                                            div()
-                                                .text_color(token_color)
-                                                .child(after_sel.to_string()),
+                                            div().text_color(token_color).child(text.clone()),
                                         );
                                     }
                                 } else if cursor_in_token {
@@ -790,46 +847,43 @@ impl Render for TextEditor {
                                     line_div = line_div
                                         .child(div().text_color(token_color).child(text.clone()));
                                 }
-                            } else if cursor_in_token {
-                                let cursor_offset = self.cursor_position - token_start;
-                                let before = &text[..cursor_offset];
-                                let after = &text[cursor_offset..];
 
-                                if !before.is_empty() {
-                                    line_div = line_div.child(
-                                        div().text_color(token_color).child(before.to_string()),
-                                    );
-                                }
-                                line_div =
-                                    line_div.child(div().w(px(4.0)).h(px(18.0)).bg(rgb(0xcccccc)));
-                                if !after.is_empty() {
-                                    line_div = line_div.child(
-                                        div().text_color(token_color).child(after.to_string()),
-                                    );
-                                }
-                            } else {
-                                line_div = line_div
-                                    .child(div().text_color(token_color).child(text.clone()));
+                                char_count += text.len();
                             }
 
-                            char_count += text.len();
-                        }
-
-                        if cursor_on_line {
-                            let cursor_col = self.cursor_position - line_start;
-                            if cursor_col == line.len() {
-                                line_div =
-                                    line_div.child(div().w(px(4.0)).h(px(18.0)).bg(rgb(0xcccccc)));
+                            if cursor_on_line {
+                                let cursor_col = self.cursor_position - line_start;
+                                if cursor_col == line.len() {
+                                    line_div = line_div
+                                        .child(div().w(px(4.0)).h(px(18.0)).bg(rgb(0xcccccc)));
+                                }
                             }
+
+                            result = result.child(line_div);
+                            current_pos = line_end + 1;
                         }
 
-                        result = result.child(line_div);
-                        current_pos = line_end + 1;
-                    }
-
-                    result
-                }),
-            ));
+                        result
+                    })),
+            )
+            .child(
+                div()
+                    .mt_2()
+                    .pt_2()
+                    .border_t_1()
+                    .border_color(rgb(0x454545))
+                    .flex()
+                    .flex_row()
+                    .justify_between()
+                    .text_xs()
+                    .text_color(rgb(0x808080))
+                    .child(div().child(format!("Line {}", self.get_current_line_number())))
+                    .child(div().child(if self.is_dirty {
+                        "● unsaved"
+                    } else {
+                        "✓ saved"
+                    })),
+            );
 
         // Wrap in a container and add palette overlay if open
         if let Some(palette_entity) = &self.palette {
