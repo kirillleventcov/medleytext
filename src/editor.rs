@@ -9,6 +9,7 @@ use gpui::{
     ScrollWheelEvent, Window, actions, div, prelude::*, px, rgb,
 };
 
+use crate::autocomplete::Autocomplete;
 use crate::markdown::MarkdownHighlighter;
 use crate::palette::Palette;
 
@@ -83,6 +84,9 @@ pub struct TextEditor {
 
     /// Tracks if buffer has unsaved changes.
     is_dirty: bool,
+
+    /// Autocomplete suggestion menu. `None` when not active.
+    autocomplete: Option<Autocomplete>,
 }
 
 impl TextEditor {
@@ -143,6 +147,7 @@ impl TextEditor {
             palette: None,
             working_dir,
             is_dirty: false,
+            autocomplete: None,
         }
     }
 
@@ -155,6 +160,17 @@ impl TextEditor {
             .filter(|&c| c == '\n')
             .count()
             + 1
+    }
+
+    /// Gets the content of the current line up to the cursor position.
+    ///
+    /// Used for autocomplete trigger detection.
+    fn get_current_line_content(&self) -> String {
+        let start = self.content[..self.cursor_position]
+            .rfind('\n')
+            .map(|pos| pos + 1)
+            .unwrap_or(0);
+        self.content[start..self.cursor_position].to_string()
     }
 
     /// Returns the normalized selection range as (start, end) byte offsets.
@@ -225,6 +241,19 @@ impl TextEditor {
         self.content.insert(self.cursor_position, c);
         self.cursor_position += 1;
         self.is_dirty = true;
+
+        // Check if this character should trigger autocomplete
+        let trigger = c.to_string();
+        let triggers = ["#", "-", "`", ">", "[", "*"];
+
+        if triggers.contains(&trigger.as_str()) {
+            let line_content = self.get_current_line_content();
+            self.autocomplete = Autocomplete::new(&trigger, &line_content);
+        } else if c == ' ' || c == '\n' {
+            // Close autocomplete on space or newline
+            self.autocomplete = None;
+        }
+
         cx.notify();
     }
 
@@ -235,6 +264,9 @@ impl TextEditor {
     /// - Otherwise: delete character before cursor
     /// - Does nothing if cursor is at document start
     fn handle_backspace(&mut self, _: &Backspace, _: &mut Window, cx: &mut Context<Self>) {
+        // Close autocomplete on backspace
+        self.autocomplete = None;
+
         if !self.delete_selection() {
             if self.cursor_position > 0 {
                 self.cursor_position -= 1;
@@ -248,7 +280,28 @@ impl TextEditor {
     }
 
     /// Handles Enter key press by inserting a newline at cursor position.
+    /// If autocomplete is active, accepts the selected suggestion instead.
     fn handle_enter(&mut self, _: &Enter, _: &mut Window, cx: &mut Context<Self>) {
+        // If autocomplete is active, accept the selected suggestion
+        if let Some(autocomplete) = &self.autocomplete {
+            if let Some(suggestion) = autocomplete.get_selected() {
+                // Get the line start position
+                let line_start = self.content[..self.cursor_position]
+                    .rfind('\n')
+                    .map(|pos| pos + 1)
+                    .unwrap_or(0);
+
+                // Replace from line start to cursor with the suggestion
+                self.content.drain(line_start..self.cursor_position);
+                self.content.insert_str(line_start, &suggestion.insert_text);
+                self.cursor_position = line_start + suggestion.insert_text.len();
+                self.is_dirty = true;
+            }
+            self.autocomplete = None;
+            cx.notify();
+            return;
+        }
+
         self.content.insert(self.cursor_position, '\n');
         self.cursor_position += 1;
         self.is_dirty = true;
@@ -258,6 +311,7 @@ impl TextEditor {
     /// Moves cursor left by one character.
     /// Clears any active selection (standard non-shift arrow key behavior).
     fn handle_move_left(&mut self, _: &MoveLeft, _: &mut Window, cx: &mut Context<Self>) {
+        self.autocomplete = None;
         self.clear_selection();
         if self.cursor_position > 0 {
             self.cursor_position -= 1;
@@ -268,6 +322,7 @@ impl TextEditor {
     /// Moves cursor right by one character.
     /// Clears any active selection (standard non-shift arrow key behavior).
     fn handle_move_right(&mut self, _: &MoveRight, _: &mut Window, cx: &mut Context<Self>) {
+        self.autocomplete = None;
         self.clear_selection();
         if self.cursor_position < self.content.len() {
             self.cursor_position += 1;
@@ -277,7 +332,15 @@ impl TextEditor {
 
     /// Moves cursor up one line, maintaining horizontal column position when possible.
     /// Clears any active selection.
+    /// If autocomplete is active, navigates suggestions instead.
     fn handle_move_up(&mut self, _: &MoveUp, _: &mut Window, cx: &mut Context<Self>) {
+        // If autocomplete is active, navigate suggestions
+        if let Some(ref mut autocomplete) = self.autocomplete {
+            autocomplete.move_up();
+            cx.notify();
+            return;
+        }
+
         self.clear_selection();
         self.move_up_internal();
         cx.notify();
@@ -285,7 +348,15 @@ impl TextEditor {
 
     /// Moves cursor down one line, maintaining horizontal column position when possible.
     /// Clears any active selection.
+    /// If autocomplete is active, navigates suggestions instead.
     fn handle_move_down(&mut self, _: &MoveDown, _: &mut Window, cx: &mut Context<Self>) {
+        // If autocomplete is active, navigate suggestions
+        if let Some(ref mut autocomplete) = self.autocomplete {
+            autocomplete.move_down();
+            cx.notify();
+            return;
+        }
+
         self.clear_selection();
         self.move_down_internal();
         cx.notify();
@@ -699,6 +770,13 @@ impl Render for TextEditor {
             .on_action(cx.listener(Self::handle_select_all))
             .on_action(cx.listener(Self::handle_toggle_palette))
             .on_key_down(cx.listener(|editor, event: &KeyDownEvent, _, cx| {
+                // Handle Escape to close autocomplete
+                if event.keystroke.key == "escape" && editor.autocomplete.is_some() {
+                    editor.autocomplete = None;
+                    cx.notify();
+                    return;
+                }
+
                 // Regular character input (only when palette is closed)
                 if editor.palette.is_none() {
                     if let Some(key_char) = &event.keystroke.key_char {
@@ -885,14 +963,69 @@ impl Render for TextEditor {
                     })),
             );
 
-        // Wrap in a container and add palette overlay if open
-        if let Some(palette_entity) = &self.palette {
-            div()
-                .size_full()
-                .child(editor_content)
-                .child(palette_entity.clone())
-        } else {
-            div().size_full().child(editor_content)
+        // Wrap in a container and add overlays (autocomplete and/or palette)
+        let mut container = div().size_full().child(editor_content);
+
+        // Add autocomplete overlay if active
+        if let Some(autocomplete) = &self.autocomplete {
+            let suggestions = autocomplete.get_suggestions_display();
+
+            // Calculate cursor position for positioning the dropdown
+            let line_height = 22.0;
+            let header_height = 30.0;
+            let padding = 16.0;
+            let current_line = self.get_current_line_number() as f32 - 1.0;
+            let top = padding + header_height + (current_line * line_height) + line_height
+                - self.scroll_offset;
+
+            let autocomplete_menu = div()
+                .absolute()
+                .top(px(top))
+                .left(px(padding))
+                .w(px(400.0))
+                .bg(rgb(0x2d2d2d))
+                .border_1()
+                .border_color(rgb(0x454545))
+                .rounded_md()
+                .shadow_lg()
+                .flex()
+                .flex_col()
+                .overflow_hidden()
+                .children(suggestions.iter().map(|(is_selected, suggestion)| {
+                    div()
+                        .p_2()
+                        .pl_3()
+                        .bg(crate::autocomplete::Autocomplete::item_bg_color(
+                            *is_selected,
+                        ))
+                        .flex()
+                        .flex_row()
+                        .justify_between()
+                        .child(
+                            div()
+                                .text_sm()
+                                .font_family("monospace")
+                                .text_color(crate::autocomplete::Autocomplete::item_text_color(
+                                    *is_selected,
+                                ))
+                                .child(suggestion.insert_text.clone()),
+                        )
+                        .child(
+                            div()
+                                .text_xs()
+                                .text_color(rgb(0x808080))
+                                .child(suggestion.label.clone()),
+                        )
+                }));
+
+            container = container.child(autocomplete_menu);
         }
+
+        // Add palette overlay if open
+        if let Some(palette_entity) = &self.palette {
+            container = container.child(palette_entity.clone());
+        }
+
+        container
     }
 }

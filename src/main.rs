@@ -3,6 +3,7 @@
 //! This is the main entry point for the application. It handles initialization,
 //! key binding configuration, and window creation.
 
+mod autocomplete;
 mod editor;
 mod markdown;
 mod palette;
