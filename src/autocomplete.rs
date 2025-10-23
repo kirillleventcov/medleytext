@@ -136,14 +136,58 @@ impl Autocomplete {
 
         // Inline code (trigger: ` in middle of line)
         if trigger == "`" && !trimmed.is_empty() && !trimmed.starts_with("``") {
-            return Some(vec![Suggestion {
-                insert_text: "``".to_string(),
-                label: "Inline code".to_string(),
-            }]);
+            // Check content BEFORE the just-typed backtick
+            let content_before_trigger = if line_content.len() > 1 {
+                &line_content[..line_content.len() - 1]
+            } else {
+                ""
+            };
+
+            // Count backticks before the one we just typed
+            let backtick_count = content_before_trigger.matches('`').count();
+            if backtick_count % 2 == 0 {
+                // Even number means we're starting a new inline code
+                return Some(vec![Suggestion {
+                    insert_text: "``".to_string(),
+                    label: "Inline code".to_string(),
+                }]);
+            }
+            // Odd number means we're closing, don't show autocomplete
+            return None;
         }
 
         // Bold/Italic (trigger: *)
         if trigger == "*" && !line_content.is_empty() {
+            // Need to check the content BEFORE the just-typed asterisk
+            // to determine if we're opening or closing
+            let content_before_trigger = if line_content.len() > 1 {
+                &line_content[..line_content.len() - 1]
+            } else {
+                ""
+            };
+
+            // Count unpaired asterisks before the one we just typed
+            let mut unpaired_single = 0;
+            let mut unpaired_double = 0;
+            let mut chars = content_before_trigger.chars().peekable();
+
+            while let Some(ch) = chars.next() {
+                if ch == '*' {
+                    if chars.peek() == Some(&'*') {
+                        chars.next();
+                        unpaired_double += 1;
+                    } else {
+                        unpaired_single += 1;
+                    }
+                }
+            }
+
+            // If we have unpaired formatting markers, we're likely closing
+            if unpaired_single % 2 == 1 || unpaired_double % 2 == 1 {
+                return None;
+            }
+
+            // Otherwise, show suggestions for starting new formatting
             return Some(vec![
                 Suggestion {
                     insert_text: "**".to_string(),
