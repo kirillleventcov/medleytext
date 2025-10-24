@@ -31,8 +31,6 @@ pub struct Palette {
     selected_index: usize,
     /// GPUI focus handle for keyboard event routing
     focus_handle: FocusHandle,
-    /// Working directory path for relative path calculation
-    working_dir: PathBuf,
     /// Flag indicating if user pressed Enter to select a file
     pub should_open: bool,
     /// Flag indicating if user pressed Escape to close
@@ -56,7 +54,6 @@ impl Palette {
             filtered_files,
             selected_index: 0,
             focus_handle: cx.focus_handle(),
-            working_dir,
             should_open: false,
             should_close: false,
         }

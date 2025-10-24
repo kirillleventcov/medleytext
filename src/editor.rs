@@ -13,8 +13,8 @@ use crate::autocomplete::Autocomplete;
 use crate::markdown::MarkdownHighlighter;
 use crate::palette::Palette;
 
-/// Define GPUI actions for keyboard shortcuts and user commands.
-/// These actions are bound to keys in main.rs and handled by the TextEditor.
+// Define GPUI actions for keyboard shortcuts and user commands.
+// These actions are bound to keys in main.rs and handled by the TextEditor.
 actions!(
     editor,
     [
@@ -727,14 +727,14 @@ impl Render for TextEditor {
             let palette = palette_entity.read(cx);
             if palette.should_open {
                 let selected_file = palette.get_selected_file();
-                drop(palette); // Release the read lock
+                let _ = palette;
                 if let Some(file_to_load) = selected_file {
                     self.palette = None;
                     window.focus(&self.focus_handle);
                     self.load_file(file_to_load, cx);
                 }
             } else if palette.should_close {
-                drop(palette); // Release the read lock
+                let _ = palette;
                 self.palette = None;
                 window.focus(&self.focus_handle);
                 cx.notify();
