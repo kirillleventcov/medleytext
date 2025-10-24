@@ -6,10 +6,11 @@
 
 use gpui::{
     App, ClipboardItem, Context, FocusHandle, Focusable, KeyDownEvent, MouseDownEvent, Render,
-    ScrollWheelEvent, Window, actions, div, prelude::*, px, rgb,
+    Rgba, ScrollWheelEvent, Window, actions, div, prelude::*, px, rgb,
 };
 
 use crate::autocomplete::Autocomplete;
+use crate::find::{ActiveInput, FindPanelState, SearchMatch};
 use crate::markdown::MarkdownHighlighter;
 use crate::palette::Palette;
 
@@ -34,6 +35,9 @@ actions!(
         SelectUp,
         SelectDown,
         SelectAll,
+        ToggleFind,
+        FindNext,
+        FindPrevious,
         TogglePalette,
     ]
 );
@@ -87,6 +91,64 @@ pub struct TextEditor {
 
     /// Autocomplete suggestion menu. `None` when not active.
     autocomplete: Option<Autocomplete>,
+
+    /// Find/replace panel state. `None` when closed.
+    find_panel: Option<FindPanelState>,
+
+    /// Guards against the editor handling Enter after the find panel consumed it.
+    suppress_next_enter: bool,
+}
+
+#[derive(Clone)]
+struct RenderRun {
+    text: String,
+    text_color: Rgba,
+    background: Option<Rgba>,
+}
+
+enum SegmentPiece {
+    Text(RenderRun),
+    Cursor,
+}
+
+#[derive(Clone, Copy)]
+struct HighlightSlice {
+    start: usize,
+    end: usize,
+    kind: HighlightKind,
+}
+
+#[derive(Clone, Copy)]
+enum HighlightKind {
+    Selection,
+    SearchActive,
+    SearchMatch,
+}
+
+impl HighlightKind {
+    fn priority(&self) -> u8 {
+        match self {
+            HighlightKind::Selection => 3,
+            HighlightKind::SearchActive => 2,
+            HighlightKind::SearchMatch => 1,
+        }
+    }
+
+    fn background(&self) -> Rgba {
+        match self {
+            HighlightKind::Selection => rgb(0x264F78),
+            HighlightKind::SearchActive => rgb(0xF8C555),
+            HighlightKind::SearchMatch => rgb(0x3d315b),
+        }
+    }
+
+    fn text_color(&self, _fallback: Rgba) -> Rgba {
+        match self {
+            HighlightKind::Selection => rgb(0xffffff),
+            HighlightKind::SearchActive => rgb(0x1e1e1e),
+            HighlightKind::SearchMatch => rgb(0xffffff),
+        }
+    }
 }
 
 impl TextEditor {
@@ -148,6 +210,8 @@ impl TextEditor {
             working_dir,
             is_dirty: false,
             autocomplete: None,
+            find_panel: None,
+            suppress_next_enter: false,
         }
     }
 
@@ -196,6 +260,439 @@ impl TextEditor {
     fn get_selected_text(&self) -> Option<String> {
         self.get_selection_range()
             .map(|(start, end)| self.content[start..end].to_string())
+    }
+
+    /// Recomputes matches when content or query changes.
+    fn refresh_search_matches(&mut self) {
+        let has_panel = self.find_panel.is_some();
+        if let Some(find) = self.find_panel.as_mut() {
+            find.recompute_matches(&self.content);
+        }
+        if has_panel {
+            if !self.focus_current_search_match() {
+                self.selection_start = None;
+            }
+        }
+    }
+
+    /// Opens the find panel, seeding it from the current selection when possible.
+    fn open_find_panel(&mut self) {
+        let initial = self
+            .get_selected_text()
+            .filter(|text| !text.trim().is_empty() && !text.contains('\n'));
+        let mut panel = FindPanelState::new(initial);
+        panel.recompute_matches(&self.content);
+        self.find_panel = Some(panel);
+    }
+
+    /// Closes the panel and clears highlights.
+    fn close_find_panel(&mut self) {
+        self.find_panel = None;
+    }
+
+    /// Ensures the byte offset is visible inside the viewport.
+    fn ensure_position_visible(&mut self, byte_offset: usize) {
+        let line_height = 22.0;
+        let viewport_height = 538.0;
+        let mut consumed = 0;
+
+        for (idx, line) in self.content.split('\n').enumerate() {
+            let line_len = line.len();
+            if byte_offset <= consumed + line_len {
+                let top = idx as f32 * line_height;
+                let bottom = top + line_height;
+                let viewport_top = self.scroll_offset;
+                let viewport_bottom = viewport_top + viewport_height;
+
+                if top < viewport_top {
+                    self.scroll_offset = top.max(0.0);
+                } else if bottom > viewport_bottom {
+                    self.scroll_offset = (bottom - viewport_height).max(0.0);
+                }
+                break;
+            }
+            consumed += line_len + 1;
+        }
+    }
+
+    /// Applies selection and caret to the provided match range.
+    fn focus_match(&mut self, range: SearchMatch) {
+        self.selection_start = Some(range.start);
+        self.cursor_position = range.end;
+        self.ensure_position_visible(range.start);
+    }
+
+    fn focus_current_search_match(&mut self) -> bool {
+        if let Some(panel) = &self.find_panel {
+            if let Some(range) = panel.current_match() {
+                self.focus_match(range);
+                return true;
+            }
+        }
+        false
+    }
+
+    /// Advances search selection by direction and updates view.
+    fn advance_search(&mut self, direction: isize) -> Option<SearchMatch> {
+        if let Some(panel) = self.find_panel.as_mut() {
+            if !panel.has_matches() {
+                return None;
+            }
+            let range = panel.cycle(direction)?;
+            panel.refresh_anchor();
+            Some(range)
+        } else {
+            None
+        }
+    }
+
+    /// Handles backspace when the find panel is active.
+    fn handle_find_backspace(&mut self, cx: &mut Context<Self>) -> bool {
+        if let Some(panel) = self.find_panel.as_mut() {
+            panel.backspace(&self.content);
+            if panel.has_matches() {
+                panel.refresh_anchor();
+                self.focus_current_search_match();
+            } else {
+                self.selection_start = None;
+            }
+            cx.notify();
+            return true;
+        }
+        false
+    }
+
+    /// Replaces the current match with the replacement text.
+    fn replace_current_match(&mut self) -> bool {
+        let (range, replacement) = {
+            let panel = match self.find_panel.as_ref() {
+                Some(panel) if panel.has_matches() && !panel.query.is_empty() => panel,
+                _ => return false,
+            };
+            // Only allow replacements when the UI exposes the intent.
+            if !panel.show_replace {
+                return false;
+            }
+            let replace_value = panel.replace.clone();
+            let range = panel.current_match().unwrap();
+            (range, replace_value)
+        };
+
+        self.content
+            .replace_range(range.start..range.end, &replacement);
+        self.cursor_position = range.start + replacement.len();
+        self.selection_start = Some(range.start);
+        self.is_dirty = true;
+
+        self.refresh_search_matches();
+        if let Some(panel) = self.find_panel.as_mut() {
+            panel.refresh_anchor();
+        }
+        true
+    }
+
+    /// Replaces all matches, returning how many edits were made.
+    fn replace_all_matches(&mut self) -> usize {
+        let (needle, replacement) = {
+            let panel = match self.find_panel.as_ref() {
+                Some(panel) if panel.has_query() && panel.show_replace => panel,
+                _ => return 0,
+            };
+            (panel.query.clone(), panel.replace.clone())
+        };
+
+        if needle.is_empty() {
+            return 0;
+        }
+
+        let mut replaced = 0;
+        let mut search_index = 0;
+
+        while search_index <= self.content.len() {
+            let tail = &self.content[search_index..];
+            if let Some(found) = tail.find(&needle) {
+                let start = search_index + found;
+                let end = start + needle.len();
+                self.content.replace_range(start..end, &replacement);
+                search_index = start + replacement.len();
+                replaced += 1;
+            } else {
+                break;
+            }
+        }
+
+        if replaced > 0 {
+            self.cursor_position = self.cursor_position.min(self.content.len());
+            self.selection_start = None;
+            self.is_dirty = true;
+            self.refresh_search_matches();
+            if let Some(panel) = self.find_panel.as_mut() {
+                panel.refresh_anchor();
+            }
+        }
+
+        replaced
+    }
+
+    fn build_segments_for_token(
+        &self,
+        text: &str,
+        token_color: Rgba,
+        token_start: usize,
+        selection_range: Option<(usize, usize)>,
+        cursor_position: Option<usize>,
+        search_panel: Option<&FindPanelState>,
+    ) -> Vec<SegmentPiece> {
+        let token_len = text.len();
+        if token_len == 0 {
+            return Vec::new();
+        }
+
+        let token_end = token_start + token_len;
+        let mut slices = Vec::new();
+
+        if let Some((sel_start, sel_end)) = selection_range {
+            if sel_end > token_start && sel_start < token_end {
+                slices.push(HighlightSlice {
+                    start: sel_start.max(token_start) - token_start,
+                    end: sel_end.min(token_end) - token_start,
+                    kind: HighlightKind::Selection,
+                });
+            }
+        }
+
+        if let Some(panel) = search_panel {
+            if panel.has_query() {
+                let active_index = panel.current_index();
+                for (idx, search_match) in panel.matches.iter().enumerate() {
+                    if search_match.end <= token_start {
+                        continue;
+                    }
+                    if search_match.start >= token_end {
+                        break;
+                    }
+                    let kind = if Some(idx) == active_index {
+                        HighlightKind::SearchActive
+                    } else {
+                        HighlightKind::SearchMatch
+                    };
+                    slices.push(HighlightSlice {
+                        start: search_match.start.max(token_start) - token_start,
+                        end: search_match.end.min(token_end) - token_start,
+                        kind,
+                    });
+                }
+            }
+        }
+
+        let mut boundaries = vec![0, token_len];
+        for slice in &slices {
+            boundaries.push(slice.start);
+            boundaries.push(slice.end);
+        }
+        boundaries.sort_unstable();
+        boundaries.dedup();
+
+        let mut segments = Vec::new();
+        for range in boundaries.windows(2) {
+            let start = range[0];
+            let end = range[1];
+            if start == end {
+                continue;
+            }
+
+            let mut run = RenderRun {
+                text: text[start..end].to_string(),
+                text_color: token_color,
+                background: None,
+            };
+
+            if let Some(active_slice) = slices
+                .iter()
+                .filter(|slice| slice.start < end && slice.end > start)
+                .max_by_key(|slice| slice.kind.priority())
+            {
+                run.background = Some(active_slice.kind.background());
+                run.text_color = active_slice.kind.text_color(token_color);
+            }
+
+            segments.push(SegmentPiece::Text(run));
+        }
+
+        if segments.is_empty() {
+            segments.push(SegmentPiece::Text(RenderRun {
+                text: text.to_string(),
+                text_color: token_color,
+                background: None,
+            }));
+        }
+
+        if let Some(cursor_abs) = cursor_position {
+            let overlaps_selection = selection_range
+                .map(|(sel_start, sel_end)| sel_end > token_start && sel_start < token_end)
+                .unwrap_or(false);
+
+            if !overlaps_selection && cursor_abs >= token_start && cursor_abs < token_end {
+                let cursor_offset = cursor_abs - token_start;
+                return Self::insert_cursor_segment(segments, cursor_offset);
+            }
+        }
+
+        segments
+    }
+
+    fn insert_cursor_segment(
+        segments: Vec<SegmentPiece>,
+        cursor_offset: usize,
+    ) -> Vec<SegmentPiece> {
+        let mut consumed = 0;
+        let mut result = Vec::new();
+        let mut inserted = false;
+
+        for segment in segments {
+            match segment {
+                SegmentPiece::Text(run) => {
+                    let seg_len = run.text.len();
+
+                    if !inserted && cursor_offset >= consumed && cursor_offset <= consumed + seg_len
+                    {
+                        let local = cursor_offset - consumed;
+                        if local == 0 {
+                            result.push(SegmentPiece::Cursor);
+                            result.push(SegmentPiece::Text(run));
+                        } else if local == seg_len {
+                            result.push(SegmentPiece::Text(run));
+                            result.push(SegmentPiece::Cursor);
+                        } else {
+                            let text = run.text;
+                            let text_color = run.text_color;
+                            let background = run.background;
+                            let left_text = text[..local].to_string();
+                            let right_text = text[local..].to_string();
+
+                            result.push(SegmentPiece::Text(RenderRun {
+                                text: left_text,
+                                text_color,
+                                background,
+                            }));
+                            result.push(SegmentPiece::Cursor);
+                            result.push(SegmentPiece::Text(RenderRun {
+                                text: right_text,
+                                text_color,
+                                background,
+                            }));
+                        }
+                        inserted = true;
+                    } else {
+                        result.push(SegmentPiece::Text(run));
+                    }
+
+                    consumed += seg_len;
+                }
+                SegmentPiece::Cursor => result.push(SegmentPiece::Cursor),
+            }
+        }
+
+        if !inserted {
+            result.push(SegmentPiece::Cursor);
+        }
+
+        result
+    }
+
+    /// Routes key events to the find panel when it is open.
+    fn handle_find_key_event(&mut self, event: &KeyDownEvent, cx: &mut Context<Self>) -> bool {
+        if self.find_panel.is_none() {
+            return false;
+        }
+
+        // Esc closes the panel.
+        if event.keystroke.key == "escape" {
+            self.close_find_panel();
+            cx.notify();
+            return true;
+        }
+
+        // Tab cycles between query/replace when both are visible.
+        if event.keystroke.key == "tab" {
+            if let Some(panel) = self.find_panel.as_mut() {
+                if panel.show_replace {
+                    let next = match panel.active_input {
+                        ActiveInput::Query => ActiveInput::Replace,
+                        ActiveInput::Replace => ActiveInput::Query,
+                    };
+                    panel.set_active_input(next);
+                    cx.notify();
+                    return true;
+                }
+            }
+        }
+
+        // Ctrl+H toggles replace visibility.
+        if event.keystroke.key == "h"
+            && event.keystroke.modifiers.control
+            && !event.keystroke.modifiers.alt
+            && !event.keystroke.modifiers.platform
+        {
+            if let Some(panel) = self.find_panel.as_mut() {
+                panel.toggle_replace();
+                cx.notify();
+            }
+            return true;
+        }
+
+        // Ctrl+R / Ctrl+Shift+R handle replace actions.
+        if event.keystroke.key == "r"
+            && event.keystroke.modifiers.control
+            && !event.keystroke.modifiers.alt
+            && !event.keystroke.modifiers.platform
+        {
+            if event.keystroke.modifiers.shift {
+                if self.replace_all_matches() > 0 {
+                    cx.notify();
+                }
+            } else if self.replace_current_match() {
+                cx.notify();
+            }
+            return true;
+        }
+
+        // Enter navigates matches while the panel owns focus.
+        if event.keystroke.key == "enter" {
+            if let Some(range) = self.advance_search(if event.keystroke.modifiers.shift {
+                -1
+            } else {
+                1
+            }) {
+                self.focus_match(range);
+                cx.notify();
+            }
+            self.suppress_next_enter = true;
+            return true;
+        }
+
+        // Regular character input updates the active field.
+        if let Some(ref key_char) = event.keystroke.key_char {
+            if key_char.len() == 1
+                && !event.keystroke.modifiers.control
+                && !event.keystroke.modifiers.alt
+                && !event.keystroke.modifiers.platform
+            {
+                if let Some(c) = key_char.chars().next() {
+                    if let Some(panel) = self.find_panel.as_mut() {
+                        panel.push_char(c, &self.content);
+                        if panel.has_matches() {
+                            panel.refresh_anchor();
+                            self.focus_current_search_match();
+                        }
+                    }
+                    cx.notify();
+                    return true;
+                }
+            }
+        }
+
+        false
     }
 
     /// Clears the active selection without modifying content.
@@ -254,6 +751,7 @@ impl TextEditor {
             self.autocomplete = None;
         }
 
+        self.refresh_search_matches();
         cx.notify();
     }
 
@@ -264,6 +762,10 @@ impl TextEditor {
     /// - Otherwise: delete character before cursor
     /// - Does nothing if cursor is at document start
     fn handle_backspace(&mut self, _: &Backspace, _: &mut Window, cx: &mut Context<Self>) {
+        if self.handle_find_backspace(cx) {
+            return;
+        }
+
         // Close autocomplete on backspace
         self.autocomplete = None;
 
@@ -276,12 +778,18 @@ impl TextEditor {
         } else {
             self.is_dirty = true;
         }
+        self.refresh_search_matches();
         cx.notify();
     }
 
     /// Handles Enter key press by inserting a newline at cursor position.
     /// If autocomplete is active, accepts the selected suggestion instead.
     fn handle_enter(&mut self, _: &Enter, _: &mut Window, cx: &mut Context<Self>) {
+        if self.suppress_next_enter {
+            self.suppress_next_enter = false;
+            return;
+        }
+
         // If autocomplete is active, accept the selected suggestion
         if let Some(autocomplete) = &self.autocomplete {
             if let Some(suggestion) = autocomplete.get_selected() {
@@ -298,6 +806,7 @@ impl TextEditor {
                 self.is_dirty = true;
             }
             self.autocomplete = None;
+            self.refresh_search_matches();
             cx.notify();
             return;
         }
@@ -305,6 +814,7 @@ impl TextEditor {
         self.content.insert(self.cursor_position, '\n');
         self.cursor_position += 1;
         self.is_dirty = true;
+        self.refresh_search_matches();
         cx.notify();
     }
 
@@ -430,6 +940,7 @@ impl TextEditor {
                 self.content.insert_str(self.cursor_position, &text);
                 self.cursor_position += text.len();
                 self.is_dirty = true;
+                self.refresh_search_matches();
                 cx.notify();
             }
         }
@@ -442,6 +953,7 @@ impl TextEditor {
             cx.write_to_clipboard(ClipboardItem::new_string(text));
             self.delete_selection();
             self.is_dirty = true;
+            self.refresh_search_matches();
             cx.notify();
         }
     }
@@ -498,6 +1010,46 @@ impl TextEditor {
         cx.notify();
     }
 
+    fn handle_toggle_find(&mut self, _: &ToggleFind, _: &mut Window, cx: &mut Context<Self>) {
+        if self.find_panel.is_some() {
+            self.close_find_panel();
+        } else {
+            self.open_find_panel();
+            self.focus_current_search_match();
+        }
+        cx.notify();
+    }
+
+    fn handle_find_next(&mut self, _: &FindNext, _: &mut Window, cx: &mut Context<Self>) {
+        if self.find_panel.is_none() {
+            self.open_find_panel();
+            if self.focus_current_search_match() {
+                cx.notify();
+            }
+            return;
+        }
+
+        if let Some(range) = self.advance_search(1) {
+            self.focus_match(range);
+            cx.notify();
+        }
+    }
+
+    fn handle_find_previous(&mut self, _: &FindPrevious, _: &mut Window, cx: &mut Context<Self>) {
+        if self.find_panel.is_none() {
+            self.open_find_panel();
+            if self.focus_current_search_match() {
+                cx.notify();
+            }
+            return;
+        }
+
+        if let Some(range) = self.advance_search(-1) {
+            self.focus_match(range);
+            cx.notify();
+        }
+    }
+
     /// Handles Ctrl+P (Toggle Palette) action.
     /// Opens or closes the command palette for fuzzy file finding.
     fn handle_toggle_palette(
@@ -511,6 +1063,7 @@ impl TextEditor {
             self.palette = None;
             window.focus(&self.focus_handle);
         } else {
+            self.close_find_panel();
             // Open palette and transfer focus to it
             let palette_entity = cx.new(|cx| Palette::new(self.working_dir.clone(), cx));
             window.focus(&palette_entity.read(cx).focus_handle(cx));
@@ -768,8 +1321,15 @@ impl Render for TextEditor {
             .on_action(cx.listener(Self::handle_select_up))
             .on_action(cx.listener(Self::handle_select_down))
             .on_action(cx.listener(Self::handle_select_all))
+            .on_action(cx.listener(Self::handle_toggle_find))
+            .on_action(cx.listener(Self::handle_find_next))
+            .on_action(cx.listener(Self::handle_find_previous))
             .on_action(cx.listener(Self::handle_toggle_palette))
             .on_key_down(cx.listener(|editor, event: &KeyDownEvent, _, cx| {
+                if editor.handle_find_key_event(event, cx) {
+                    return;
+                }
+
                 // Handle Escape to close autocomplete
                 if event.keystroke.key == "escape" && editor.autocomplete.is_some() {
                     editor.autocomplete = None;
@@ -778,7 +1338,7 @@ impl Render for TextEditor {
                 }
 
                 // Regular character input (only when palette is closed)
-                if editor.palette.is_none() {
+                if editor.palette.is_none() && editor.find_panel.is_none() {
                     if let Some(key_char) = &event.keystroke.key_char {
                         if key_char.len() == 1
                             && !event.keystroke.modifiers.control
@@ -834,96 +1394,45 @@ impl Render for TextEditor {
 
                             let tokens = MarkdownHighlighter::tokenize_line(line);
 
-                            let mut line_div = div().flex().flex_row();
+                            let mut line_div = div().flex().flex_row().min_h(px(18.0));
                             let mut char_count = 0;
 
                             for (text, token_type) in tokens {
                                 let token_color = MarkdownHighlighter::get_color(&token_type);
                                 let token_start = line_start + char_count;
-                                let token_end = token_start + text.len();
-
-                                let cursor_in_token = cursor_on_line
-                                    && self.cursor_position >= token_start
-                                    && self.cursor_position < token_end;
-
-                                if let Some((sel_start, sel_end)) = selection_range {
-                                    if token_end > sel_start && token_start < sel_end {
-                                        let overlap_start =
-                                            sel_start.max(token_start) - token_start;
-                                        let overlap_end = sel_end.min(token_end) - token_start;
-
-                                        let before_sel = &text[..overlap_start];
-                                        let selected = &text[overlap_start..overlap_end];
-                                        let after_sel = &text[overlap_end..];
-
-                                        if !before_sel.is_empty() {
-                                            line_div = line_div.child(
-                                                div()
-                                                    .text_color(token_color)
-                                                    .child(before_sel.to_string()),
-                                            );
-                                        }
-                                        if !selected.is_empty() {
-                                            line_div = line_div.child(
-                                                div()
-                                                    .bg(rgb(0x264F78))
-                                                    .text_color(rgb(0xffffff))
-                                                    .child(selected.to_string()),
-                                            );
-                                        }
-                                        if !after_sel.is_empty() {
-                                            line_div = line_div.child(
-                                                div()
-                                                    .text_color(token_color)
-                                                    .child(after_sel.to_string()),
-                                            );
-                                        }
-                                    } else if cursor_in_token {
-                                        let cursor_offset = self.cursor_position - token_start;
-                                        let before = &text[..cursor_offset];
-                                        let after = &text[cursor_offset..];
-
-                                        if !before.is_empty() {
-                                            line_div = line_div.child(
-                                                div()
-                                                    .text_color(token_color)
-                                                    .child(before.to_string()),
-                                            );
-                                        }
-                                        line_div = line_div
-                                            .child(div().w(px(4.0)).h(px(18.0)).bg(rgb(0xcccccc)));
-                                        if !after.is_empty() {
-                                            line_div = line_div.child(
-                                                div()
-                                                    .text_color(token_color)
-                                                    .child(after.to_string()),
-                                            );
-                                        }
-                                    } else {
-                                        line_div = line_div.child(
-                                            div().text_color(token_color).child(text.clone()),
-                                        );
-                                    }
-                                } else if cursor_in_token {
-                                    let cursor_offset = self.cursor_position - token_start;
-                                    let before = &text[..cursor_offset];
-                                    let after = &text[cursor_offset..];
-
-                                    if !before.is_empty() {
-                                        line_div = line_div.child(
-                                            div().text_color(token_color).child(before.to_string()),
-                                        );
-                                    }
-                                    line_div = line_div
-                                        .child(div().w(px(4.0)).h(px(18.0)).bg(rgb(0xcccccc)));
-                                    if !after.is_empty() {
-                                        line_div = line_div.child(
-                                            div().text_color(token_color).child(after.to_string()),
-                                        );
-                                    }
+                                let cursor_pos = if cursor_on_line {
+                                    Some(self.cursor_position)
                                 } else {
-                                    line_div = line_div
-                                        .child(div().text_color(token_color).child(text.clone()));
+                                    None
+                                };
+
+                                let segments = self.build_segments_for_token(
+                                    &text,
+                                    token_color,
+                                    token_start,
+                                    selection_range,
+                                    cursor_pos,
+                                    self.find_panel.as_ref(),
+                                );
+
+                                for segment in segments {
+                                    match segment {
+                                        SegmentPiece::Cursor => {
+                                            line_div = line_div.child(
+                                                div().w(px(4.0)).h(px(18.0)).bg(rgb(0xcccccc)),
+                                            );
+                                        }
+                                        SegmentPiece::Text(run) => {
+                                            if run.text.is_empty() {
+                                                continue;
+                                            }
+                                            let mut node = div().text_color(run.text_color);
+                                            if let Some(bg) = run.background {
+                                                node = node.bg(bg);
+                                            }
+                                            line_div = line_div.child(node.child(run.text));
+                                        }
+                                    }
                                 }
 
                                 char_count += text.len();
@@ -965,6 +1474,98 @@ impl Render for TextEditor {
 
         // Wrap in a container and add overlays (autocomplete and/or palette)
         let mut container = div().size_full().child(editor_content);
+
+        if let Some(find_panel) = &self.find_panel {
+            let build_row = |label: &str, value: &str, placeholder: &str, active: bool| {
+                let display = if value.is_empty() {
+                    placeholder.to_string()
+                } else {
+                    value.to_string()
+                };
+                let text_color = if value.is_empty() {
+                    rgb(0x707070)
+                } else {
+                    rgb(0xffffff)
+                };
+
+                div()
+                    .px_3()
+                    .py_2()
+                    .bg(if active { rgb(0x3a3a3a) } else { rgb(0x2d2d2d) })
+                    .rounded_sm()
+                    .flex()
+                    .flex_col()
+                    .gap_1()
+                    .child(
+                        div()
+                            .text_xs()
+                            .text_color(rgb(0x808080))
+                            .child(label.to_string()),
+                    )
+                    .child(
+                        div()
+                            .text_sm()
+                            .font_family("monospace")
+                            .text_color(text_color)
+                            .child(display),
+                    )
+            };
+
+            let status_text = if !find_panel.has_query() {
+                "Type to search".to_string()
+            } else if !find_panel.has_matches() {
+                "No matches".to_string()
+            } else {
+                let position = find_panel.current_index().unwrap_or(0) + 1;
+                format!("{} / {} matches", position, find_panel.matches.len())
+            };
+
+            let find_overlay = div()
+                .absolute()
+                .top(px(20.0))
+                .right(px(20.0))
+                .w(px(360.0))
+                .bg(rgb(0x1f1f1f))
+                .border_1()
+                .border_color(rgb(0x454545))
+                .rounded_md()
+                .shadow_lg()
+                .flex()
+                .flex_col()
+                .gap_2()
+                .p_3()
+                .child(build_row(
+                    "Find",
+                    &find_panel.query,
+                    "Type to search...",
+                    find_panel.active_input == ActiveInput::Query,
+                ))
+                .when(find_panel.show_replace, |view| {
+                    view.child(build_row(
+                        "Replace",
+                        &find_panel.replace,
+                        "Ctrl+H to show",
+                        find_panel.active_input == ActiveInput::Replace,
+                    ))
+                })
+                .child(
+                    div()
+                        .text_xs()
+                        .text_color(rgb(0xb0b0b0))
+                        .child(status_text),
+                )
+                .child(
+                    div()
+                        .text_xs()
+                        .text_color(rgb(0x808080))
+                        .child(
+                            "Enter: next • Shift+Enter: prev • Ctrl+R: replace • Ctrl+Shift+R: replace all • Esc: close"
+                                .to_string(),
+                        ),
+                );
+
+            container = container.child(find_overlay);
+        }
 
         // Add autocomplete overlay if active
         if let Some(autocomplete) = &self.autocomplete {
