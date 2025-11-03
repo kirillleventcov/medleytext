@@ -1,7 +1,8 @@
 //! Command palette for fuzzy file finding and quick navigation.
 
+use crate::config::PaletteTheme;
 use gpui::{
-    App, Context, FocusHandle, Focusable, KeyDownEvent, Render, Window, div, prelude::*, px, rgb,
+    App, Context, FocusHandle, Focusable, KeyDownEvent, Render, Window, div, prelude::*, px,
 };
 use std::path::{Path, PathBuf};
 
@@ -35,6 +36,8 @@ pub struct Palette {
     pub should_open: bool,
     /// Flag indicating if user pressed Escape to close
     pub should_close: bool,
+    /// Theme colors for palette UI
+    theme: PaletteTheme,
 }
 
 impl Palette {
@@ -43,8 +46,9 @@ impl Palette {
     /// # Arguments
     ///
     /// * `working_dir` - Directory to scan for .md files
+    /// * `theme` - Palette-specific color theme
     /// * `cx` - GPUI context for initialization
-    pub fn new(working_dir: PathBuf, cx: &mut Context<Self>) -> Self {
+    pub fn new(working_dir: PathBuf, theme: PaletteTheme, cx: &mut Context<Self>) -> Self {
         let all_files = Self::scan_markdown_files(&working_dir);
         let filtered_files = all_files.clone();
 
@@ -56,6 +60,7 @@ impl Palette {
             focus_handle: cx.focus_handle(),
             should_open: false,
             should_close: false,
+            theme,
         }
     }
 
@@ -292,9 +297,9 @@ impl Render for Palette {
             .left(px(100.0))
             .w(px(600.0))
             .max_h(px(400.0))
-            .bg(rgb(0x2d2d2d))
+            .bg(self.theme.background)
             .border_1()
-            .border_color(rgb(0x454545))
+            .border_color(self.theme.border)
             .rounded_md()
             .shadow_lg()
             .flex()
@@ -302,20 +307,24 @@ impl Render for Palette {
             .overflow_hidden()
             // Search input area
             .child(
-                div().p_3().border_b_1().border_color(rgb(0x454545)).child(
-                    div()
-                        .text_sm()
-                        .text_color(rgb(0xcccccc))
-                        .font_family("monospace")
-                        .child(format!(
-                            "> {}",
-                            if self.query.is_empty() {
-                                "Type to search...".to_string()
-                            } else {
-                                self.query.clone()
-                            }
-                        )),
-                ),
+                div()
+                    .p_3()
+                    .border_b_1()
+                    .border_color(self.theme.border)
+                    .child(
+                        div()
+                            .text_sm()
+                            .text_color(self.theme.input_text)
+                            .font_family("monospace")
+                            .child(format!(
+                                "> {}",
+                                if self.query.is_empty() {
+                                    "Type to search...".to_string()
+                                } else {
+                                    self.query.clone()
+                                }
+                            )),
+                    ),
             )
             // Results list
             .child(
@@ -331,31 +340,39 @@ impl Render for Palette {
                             .enumerate()
                             .map(|(idx, file)| {
                                 let is_selected = idx == self.selected_index;
-                                div()
-                                    .p_2()
-                                    .pl_3()
-                                    .when(is_selected, |div| div.bg(rgb(0x094771)))
-                                    .when(!is_selected, |div| div.bg(rgb(0x2d2d2d)))
-                                    .child(
-                                        div()
-                                            .text_sm()
-                                            .font_family("monospace")
-                                            .text_color(if is_selected {
-                                                rgb(0xffffff)
-                                            } else {
-                                                rgb(0xd4d4d4)
-                                            })
-                                            .child(file.display_name.clone()),
+                                let (bg, text_color) = if is_selected {
+                                    (
+                                        self.theme.item_selected_background,
+                                        self.theme.item_selected_text,
                                     )
+                                } else {
+                                    (self.theme.item_background, self.theme.item_text)
+                                };
+                                div().p_2().pl_3().bg(bg).child(
+                                    div()
+                                        .text_sm()
+                                        .font_family("monospace")
+                                        .text_color(text_color)
+                                        .child(file.display_name.clone()),
+                                )
                             }),
                     ),
             )
             // Footer with hints
-            .child(div().p_2().border_t_1().border_color(rgb(0x454545)).child(
-                div().text_xs().text_color(rgb(0x808080)).child(format!(
-                    "{} files | ↑↓ navigate | Enter to open | Esc to close",
-                    self.filtered_files.len()
-                )),
-            ))
+            .child(
+                div()
+                    .p_2()
+                    .border_t_1()
+                    .border_color(self.theme.border)
+                    .child(
+                        div()
+                            .text_xs()
+                            .text_color(self.theme.footer_text)
+                            .child(format!(
+                                "{} files | ↑↓ navigate | Enter to open | Esc to close",
+                                self.filtered_files.len()
+                            )),
+                    ),
+            )
     }
 }

@@ -36,13 +36,95 @@ medleytext demo.md
 
 ## Configuration
 
-MedleyText reads optional settings from `~/.config/medleytext/config`. Configuration is line-based using `key=value` entries.
+MedleyText reads optional settings from `~/.config/medleytext/config`. Each non-empty line uses either `key=value` or `key: value`. Lines beginning with `#` or `//` are ignored.
+
+The file is created automatically with sensible defaults the first time you launch MedleyText, so you can open it and tweak values right away.
+
+### Core options
+
+- `font-size` &mdash; UI font size (clamped between 8 and 72, default `14`)
+
+### Theme presets
+
+Use a preset as the base palette, then override individual keys as needed:
 
 ```
-font-size=16
+theme.preset = catppuccin-mocha
 ```
 
-If the file is missing or the value cannot be parsed, the editor falls back to the default 14px font size.
+Available presets: `default`, `catppuccin-mocha`, `catppuccin-macchiato`, `catppuccin-frappe`, `catppuccin-latte`.
+
+### Color overrides
+
+Color values accept `#RRGGBB` or `0xRRGGBB`. Any unspecified key falls back to the current preset/default.
+
+- **Editor surface**
+  - `theme.editor.background`
+  - `theme.editor.border`
+  - `theme.editor.text`
+  - `theme.editor.muted-text`
+  - `theme.editor.cursor`
+- **Highlights**
+  - `theme.highlight.selection.background`
+  - `theme.highlight.selection.foreground`
+  - `theme.highlight.search-active.background`
+  - `theme.highlight.search-active.foreground`
+  - `theme.highlight.search-match.background`
+  - `theme.highlight.search-match.foreground`
+- **Panels (find dialog)**
+  - `theme.panel.background`
+  - `theme.panel.border`
+  - `theme.panel.active-row.background`
+  - `theme.panel.inactive-row.background`
+  - `theme.panel.label-text`
+  - `theme.panel.value-text`
+  - `theme.panel.placeholder-text`
+  - `theme.panel.status-text`
+  - `theme.panel.shortcut-text`
+- **Command palette**
+  - `theme.palette.background`
+  - `theme.palette.border`
+  - `theme.palette.input-text`
+  - `theme.palette.item.background`
+  - `theme.palette.item.foreground`
+  - `theme.palette.item-selected.background`
+  - `theme.palette.item-selected.foreground`
+  - `theme.palette.footer-text`
+- **Autocomplete menu**
+  - `theme.autocomplete.background`
+  - `theme.autocomplete.border`
+  - `theme.autocomplete.item.background`
+  - `theme.autocomplete.item.foreground`
+  - `theme.autocomplete.item-selected.background`
+  - `theme.autocomplete.item-selected.foreground`
+  - `theme.autocomplete.label-text`
+- **Markdown syntax**
+  - `theme.syntax.heading1` &hellip; `theme.syntax.heading6`
+  - `theme.syntax.bold`
+  - `theme.syntax.italic`
+  - `theme.syntax.code`
+  - `theme.syntax.code-block`
+  - `theme.syntax.link`
+  - `theme.syntax.list`
+  - `theme.syntax.checkbox-checked`
+  - `theme.syntax.checkbox-unchecked`
+  - `theme.syntax.blockquote`
+  - `theme.syntax.normal`
+
+### Example: Catppuccin Mocha + tweaks
+
+```
+font-size = 16
+theme.preset = catppuccin-mocha
+
+# Personal accents
+theme.highlight.selection.background = #F5C2E7
+theme.highlight.selection.foreground = #1E1E2E
+theme.palette.item-selected.background = #B4BEFE
+theme.palette.item-selected.foreground = #1E1E2E
+```
+
+Restart MedleyText (or close/open the window) after editing the config file to load new values.
 
 ## Documentation
 

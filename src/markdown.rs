@@ -3,6 +3,7 @@
 //! Provides line-based markdown parsing for syntax highlighting.
 //! Implements a simplified subset of CommonMark focused on visual distinction.
 
+use crate::config::SyntaxTheme;
 use gpui::Rgba;
 
 /// Markdown token types for syntax highlighting.
@@ -68,23 +69,19 @@ impl MarkdownHighlighter {
     /// - Checkboxes: Green (checked) / Coral (unchecked)
     /// - Blockquotes: Green
     /// - Normal: Light gray
-    pub fn get_color(token: &MarkdownToken) -> Rgba {
-        use gpui::rgb;
-
+    pub fn get_color(token: &MarkdownToken, theme: &SyntaxTheme) -> Rgba {
         match token {
-            MarkdownToken::Heading(1) => rgb(0x569CD6),        // Blue
-            MarkdownToken::Heading(2) => rgb(0x4EC9B0),        // Teal
-            MarkdownToken::Heading(_) => rgb(0x4FC1FF),        // Light blue
-            MarkdownToken::Bold => rgb(0xDCDCAA),              // Yellow
-            MarkdownToken::Italic => rgb(0xCE9178),            // Orange
-            MarkdownToken::Code => rgb(0xD16969),              // Red
-            MarkdownToken::Link => rgb(0x9CDCFE),              // Cyan
-            MarkdownToken::ListItem => rgb(0xC586C0),          // Purple
-            MarkdownToken::CheckboxChecked => rgb(0x7CB342),   // Green (bright teal)
-            MarkdownToken::CheckboxUnchecked => rgb(0xF48771), // Red-ish (coral)
-            MarkdownToken::Blockquote => rgb(0x6A9955),        // Green
-            MarkdownToken::CodeBlock => rgb(0xD16969),         // Red
-            MarkdownToken::Normal => rgb(0xD4D4D4),            // Default
+            MarkdownToken::Heading(level) => theme.heading_color(*level),
+            MarkdownToken::Bold => theme.bold,
+            MarkdownToken::Italic => theme.italic,
+            MarkdownToken::Code => theme.code,
+            MarkdownToken::Link => theme.link,
+            MarkdownToken::ListItem => theme.list,
+            MarkdownToken::CheckboxChecked => theme.checkbox_checked,
+            MarkdownToken::CheckboxUnchecked => theme.checkbox_unchecked,
+            MarkdownToken::Blockquote => theme.blockquote,
+            MarkdownToken::CodeBlock => theme.code_block,
+            MarkdownToken::Normal => theme.normal,
         }
     }
 

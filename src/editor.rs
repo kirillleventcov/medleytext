@@ -6,11 +6,11 @@
 
 use gpui::{
     App, ClipboardItem, Context, FocusHandle, Focusable, KeyDownEvent, MouseDownEvent, Render,
-    Rgba, ScrollWheelEvent, Window, actions, div, prelude::*, px, rgb,
+    Rgba, ScrollWheelEvent, Window, actions, div, prelude::*, px,
 };
 
 use crate::autocomplete::Autocomplete;
-use crate::config::EditorConfig;
+use crate::config::{EditorConfig, Theme};
 use crate::find::{ActiveInput, FindPanelState, SearchMatch};
 use crate::markdown::MarkdownHighlighter;
 use crate::palette::Palette;
@@ -138,19 +138,19 @@ impl HighlightKind {
         }
     }
 
-    fn background(&self) -> Rgba {
+    fn background(&self, theme: &Theme) -> Rgba {
         match self {
-            HighlightKind::Selection => rgb(0x264F78),
-            HighlightKind::SearchActive => rgb(0xF8C555),
-            HighlightKind::SearchMatch => rgb(0x3d315b),
+            HighlightKind::Selection => theme.highlight.selection_bg,
+            HighlightKind::SearchActive => theme.highlight.search_active_bg,
+            HighlightKind::SearchMatch => theme.highlight.search_match_bg,
         }
     }
 
-    fn text_color(&self, _fallback: Rgba) -> Rgba {
+    fn text_color(&self, _fallback: Rgba, theme: &Theme) -> Rgba {
         match self {
-            HighlightKind::Selection => rgb(0xffffff),
-            HighlightKind::SearchActive => rgb(0x1e1e1e),
-            HighlightKind::SearchMatch => rgb(0xffffff),
+            HighlightKind::Selection => theme.highlight.selection_fg,
+            HighlightKind::SearchActive => theme.highlight.search_active_fg,
+            HighlightKind::SearchMatch => theme.highlight.search_match_fg,
         }
     }
 }
@@ -483,6 +483,7 @@ impl TextEditor {
         selection_range: Option<(usize, usize)>,
         cursor_position: Option<usize>,
         search_panel: Option<&FindPanelState>,
+        theme: &Theme,
     ) -> Vec<SegmentPiece> {
         let token_len = text.len();
         if token_len == 0 {
@@ -553,8 +554,8 @@ impl TextEditor {
                 .filter(|slice| slice.start < end && slice.end > start)
                 .max_by_key(|slice| slice.kind.priority())
             {
-                run.background = Some(active_slice.kind.background());
-                run.text_color = active_slice.kind.text_color(token_color);
+                run.background = Some(active_slice.kind.background(theme));
+                run.text_color = active_slice.kind.text_color(token_color, theme);
             }
 
             segments.push(SegmentPiece::Text(run));
@@ -1106,7 +1107,10 @@ impl TextEditor {
         } else {
             self.close_find_panel();
             // Open palette and transfer focus to it
-            let palette_entity = cx.new(|cx| Palette::new(self.working_dir.clone(), cx));
+            let working_dir = self.working_dir.clone();
+            let palette_theme = self.config.theme().palette.clone();
+            let palette_entity =
+                cx.new(move |cx| Palette::new(working_dir.clone(), palette_theme.clone(), cx));
             window.focus(&palette_entity.read(cx).focus_handle(cx));
             self.palette = Some(palette_entity);
         }
@@ -1336,6 +1340,9 @@ impl Render for TextEditor {
             }
         }
 
+        let theme = self.config.theme().clone();
+        let font_family = "monospace";
+
         let editor_content = div()
             .track_focus(&self.focus_handle(cx))
             .on_mouse_down(
@@ -1399,22 +1406,27 @@ impl Render for TextEditor {
             .flex()
             .flex_col()
             .size_full()
-            .bg(rgb(0x2d2d2d))
+            .bg(theme.editor.background)
             .border_1()
-            .border_color(rgb(0x454545))
+            .border_color(theme.editor.border)
             .rounded_md()
             .shadow_lg()
-            .text_color(rgb(0xd4d4d4))
+            .text_color(theme.editor.text)
             .p_4()
-            .font_family("monospace")
+            .font_family(font_family)
             .text_size(px(self.font_size()))
-            .child(div().mb_2().text_color(rgb(0x808080)).child(format!(
+            .child(
+                div()
+                    .mb_2()
+                    .text_color(theme.editor.muted_text)
+                    .child(format!(
                         "MedleyText - {} | Ctrl+P: files | Ctrl+S: save | Ctrl+Q: quit",
                         self.current_file
                             .as_ref()
                             .map(|p| p.as_str())
                             .unwrap_or("[unsaved]")
-                    )))
+                    )),
+            )
             .child(
                 div()
                     .flex()
@@ -1442,7 +1454,8 @@ impl Render for TextEditor {
                             let mut char_count = 0;
 
                             for (text, token_type) in tokens {
-                                let token_color = MarkdownHighlighter::get_color(&token_type);
+                                let token_color =
+                                    MarkdownHighlighter::get_color(&token_type, &theme.syntax);
                                 let token_start = line_start + char_count;
                                 let cursor_pos = if cursor_on_line {
                                     Some(self.cursor_position)
@@ -1457,6 +1470,7 @@ impl Render for TextEditor {
                                     selection_range,
                                     cursor_pos,
                                     self.find_panel.as_ref(),
+                                    &theme,
                                 );
 
                                 for segment in segments {
@@ -1466,7 +1480,7 @@ impl Render for TextEditor {
                                                 div()
                                                     .w(px(4.0))
                                                     .h(px(content_line_height))
-                                                    .bg(rgb(0xcccccc)),
+                                                    .bg(theme.editor.cursor),
                                             );
                                         }
                                         SegmentPiece::Text(run) => {
@@ -1492,7 +1506,7 @@ impl Render for TextEditor {
                                         div()
                                             .w(px(4.0))
                                             .h(px(content_line_height))
-                                            .bg(rgb(0xcccccc)),
+                                            .bg(theme.editor.cursor),
                                     );
                                 }
                             }
@@ -1509,12 +1523,12 @@ impl Render for TextEditor {
                     .mt_2()
                     .pt_2()
                     .border_t_1()
-                    .border_color(rgb(0x454545))
+                    .border_color(theme.editor.border)
                     .flex()
                     .flex_row()
                     .justify_between()
                     .text_xs()
-                    .text_color(rgb(0x808080))
+                    .text_color(theme.editor.muted_text)
                     .child(div().child(format!("Line {}", self.get_current_line_number())))
                     .child(div().child(if self.is_dirty {
                         "● unsaved"
@@ -1534,15 +1548,19 @@ impl Render for TextEditor {
                     value.to_string()
                 };
                 let text_color = if value.is_empty() {
-                    rgb(0x707070)
+                    theme.panel.placeholder_text
                 } else {
-                    rgb(0xffffff)
+                    theme.panel.value_text
                 };
 
                 div()
                     .px_3()
                     .py_2()
-                    .bg(if active { rgb(0x3a3a3a) } else { rgb(0x2d2d2d) })
+                    .bg(if active {
+                        theme.panel.active_row_background
+                    } else {
+                        theme.panel.inactive_row_background
+                    })
                     .rounded_sm()
                     .flex()
                     .flex_col()
@@ -1550,13 +1568,13 @@ impl Render for TextEditor {
                     .child(
                         div()
                             .text_xs()
-                            .text_color(rgb(0x808080))
+                            .text_color(theme.panel.label_text)
                             .child(label.to_string()),
                     )
                     .child(
                         div()
                             .text_size(px(self.font_size()))
-                            .font_family("monospace")
+                            .font_family(font_family)
                             .text_color(text_color)
                             .child(display),
                     )
@@ -1576,9 +1594,9 @@ impl Render for TextEditor {
                     .top(px(self.padding()))
                     .right(px(self.padding()))
                 .w(px(360.0))
-                .bg(rgb(0x1f1f1f))
+                .bg(theme.panel.background)
                 .border_1()
-                .border_color(rgb(0x454545))
+                .border_color(theme.panel.border)
                 .rounded_md()
                 .shadow_lg()
                 .flex()
@@ -1602,13 +1620,13 @@ impl Render for TextEditor {
                 .child(
                     div()
                         .text_xs()
-                        .text_color(rgb(0xb0b0b0))
+                        .text_color(theme.panel.status_text)
                         .child(status_text),
                 )
                 .child(
                     div()
                         .text_xs()
-                        .text_color(rgb(0x808080))
+                        .text_color(theme.panel.shortcut_text)
                         .child(
                             "Enter: next • Shift+Enter: prev • Ctrl+R: replace • Ctrl+Shift+R: replace all • Esc: close"
                                 .to_string(),
@@ -1635,37 +1653,44 @@ impl Render for TextEditor {
                 .top(px(top))
                 .left(px(padding))
                 .w(px(400.0))
-                .bg(rgb(0x2d2d2d))
+                .bg(theme.autocomplete.background)
                 .border_1()
-                .border_color(rgb(0x454545))
+                .border_color(theme.autocomplete.border)
                 .rounded_md()
                 .shadow_lg()
                 .flex()
                 .flex_col()
                 .overflow_hidden()
                 .children(suggestions.iter().map(|(is_selected, suggestion)| {
+                    let item_bg = if *is_selected {
+                        theme.autocomplete.item_selected_background
+                    } else {
+                        theme.autocomplete.item_background
+                    };
+                    let item_fg = if *is_selected {
+                        theme.autocomplete.item_selected_text
+                    } else {
+                        theme.autocomplete.item_text
+                    };
+
                     div()
                         .p_2()
                         .pl_3()
-                        .bg(crate::autocomplete::Autocomplete::item_bg_color(
-                            *is_selected,
-                        ))
+                        .bg(item_bg)
                         .flex()
                         .flex_row()
                         .justify_between()
                         .child(
                             div()
                                 .text_size(px(self.font_size()))
-                                .font_family("monospace")
-                                .text_color(crate::autocomplete::Autocomplete::item_text_color(
-                                    *is_selected,
-                                ))
+                                .font_family(font_family)
+                                .text_color(item_fg)
                                 .child(suggestion.insert_text.clone()),
                         )
                         .child(
                             div()
                                 .text_xs()
-                                .text_color(rgb(0x808080))
+                                .text_color(theme.autocomplete.label_text)
                                 .child(suggestion.label.clone()),
                         )
                 }));

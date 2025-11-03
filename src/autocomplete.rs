@@ -3,8 +3,6 @@
 //! Provides inline completion suggestions when typing markdown syntax,
 //! similar to nvim's completion menu.
 
-use gpui::rgb;
-
 /// Represents a single autocomplete suggestion.
 #[derive(Debug, Clone)]
 pub struct Suggestion {
@@ -229,23 +227,5 @@ impl Autocomplete {
             .enumerate()
             .map(|(idx, sug)| (idx == self.selected_index, sug))
             .collect()
-    }
-
-    /// Returns the background color for autocomplete items.
-    pub fn item_bg_color(is_selected: bool) -> gpui::Rgba {
-        if is_selected {
-            rgb(0x094771) // Selected item background
-        } else {
-            rgb(0x2d2d2d) // Normal item background
-        }
-    }
-
-    /// Returns the text color for autocomplete items.
-    pub fn item_text_color(is_selected: bool) -> gpui::Rgba {
-        if is_selected {
-            rgb(0xffffff) // Selected item text
-        } else {
-            rgb(0xd4d4d4) // Normal item text
-        }
     }
 }
