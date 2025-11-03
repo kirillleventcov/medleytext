@@ -10,6 +10,7 @@ use gpui::{
 };
 
 use crate::autocomplete::Autocomplete;
+use crate::config::EditorConfig;
 use crate::find::{ActiveInput, FindPanelState, SearchMatch};
 use crate::markdown::MarkdownHighlighter;
 use crate::palette::Palette;
@@ -97,6 +98,9 @@ pub struct TextEditor {
 
     /// Guards against the editor handling Enter after the find panel consumed it.
     suppress_next_enter: bool,
+
+    /// Editor configuration loaded from disk.
+    config: EditorConfig,
 }
 
 #[derive(Clone)]
@@ -169,7 +173,11 @@ impl TextEditor {
     ///
     /// File read errors are logged to stderr but don't prevent editor initialization.
     /// This allows creating new files or recovering from read permission issues.
-    pub fn with_file(file_path: Option<String>, cx: &mut Context<Self>) -> Self {
+    pub fn with_file(
+        file_path: Option<String>,
+        config: EditorConfig,
+        cx: &mut Context<Self>,
+    ) -> Self {
         let (content, current_file) = if let Some(path) = file_path {
             match std::fs::read_to_string(&path) {
                 Ok(content) => {
@@ -212,7 +220,40 @@ impl TextEditor {
             autocomplete: None,
             find_panel: None,
             suppress_next_enter: false,
+            config,
         }
+    }
+
+    fn font_size(&self) -> f32 {
+        self.config.font_size()
+    }
+
+    fn font_scale(&self) -> f32 {
+        (self.font_size() / EditorConfig::DEFAULT_FONT_SIZE).max(0.5)
+    }
+
+    fn line_height(&self) -> f32 {
+        20.0 * self.font_scale()
+    }
+
+    fn cursor_height(&self) -> f32 {
+        (self.line_height() - 2.0 * self.font_scale()).max(8.0)
+    }
+
+    fn char_width(&self) -> f32 {
+        8.0 * self.font_scale()
+    }
+
+    fn header_height(&self) -> f32 {
+        self.line_height() + 8.0 * self.font_scale()
+    }
+
+    fn padding(&self) -> f32 {
+        16.0
+    }
+
+    fn viewport_height(&self) -> f32 {
+        538.0 - 20.0 + self.line_height()
     }
 
     /// Calculates the current line number (1-indexed) based on cursor position.
@@ -292,8 +333,8 @@ impl TextEditor {
 
     /// Ensures the byte offset is visible inside the viewport.
     fn ensure_position_visible(&mut self, byte_offset: usize) {
-        let line_height = 22.0;
-        let viewport_height = 538.0;
+        let line_height = self.line_height();
+        let viewport_height = self.viewport_height();
         let mut consumed = 0;
 
         for (idx, line) in self.content.split('\n').enumerate() {
@@ -1101,20 +1142,20 @@ impl TextEditor {
     /// 2. Calculating column from X coordinate
     /// 3. Converting (line, column) to byte offset
     ///
-    /// # Magic Numbers
+    /// # Layout Metrics
     ///
-    /// Hardcoded layout constants should be extracted to `TextEditor` constants:
-    /// - `char_width`: 7.2px (assumes monospace font)
-    /// - `line_height`: 22px
-    /// - `header_height`: 30px (status bar)
-    /// - `padding`: 16px
+    /// Values derive from the configured font size. Defaults (font-size 14px) yield:
+    /// - `char_width` ≈ 8px (monospace width)
+    /// - `line_height` ≈ 20px
+    /// - `header_height` ≈ 28px (line height + header spacing)
+    /// - `padding` = 16px (p_4)
     fn handle_mouse_down(&mut self, event: &MouseDownEvent, cx: &mut Context<Self>) {
         self.clear_selection();
 
-        let char_width = px(7.2);
-        let line_height = px(22.0);
-        let header_height = px(30.0);
-        let padding = px(16.0);
+        let char_width = px(self.char_width());
+        let line_height = px(self.line_height());
+        let header_height = px(self.header_height());
+        let padding = px(self.padding());
 
         let click_x = event.position.x - padding;
         let click_y = event.position.y - padding - header_height + px(self.scroll_offset);
@@ -1146,12 +1187,13 @@ impl TextEditor {
     /// Supports both pixel-based and line-based scroll deltas.
     /// Clamps scroll offset to valid range [0, max_content_height - viewport_height].
     ///
-    /// # Magic Numbers
+    /// # Layout Metrics
     ///
-    /// - `line_height`: 22.0px (should match rendering constant)
-    /// - `viewport_height`: 538.0px (derived from window height - header - padding)
+    /// Derived from the configured font metrics. At the default font size (14px):
+    /// - `line_height` ≈ 20px
+    /// - `viewport_height` ≈ 538px (window height minus padding/header)
     fn handle_scroll_wheel(&mut self, event: &ScrollWheelEvent, cx: &mut Context<Self>) {
-        let line_height = 22.0;
+        let line_height = self.line_height();
 
         let scroll_amount = match event.delta {
             gpui::ScrollDelta::Pixels(delta) => delta.y.into(),
@@ -1163,7 +1205,7 @@ impl TextEditor {
         let lines: Vec<&str> = self.content.split('\n').collect();
         let total_content_height = lines.len() as f32 * line_height;
 
-        let viewport_height = 538.0;
+        let viewport_height = self.viewport_height();
         let max_scroll = (total_content_height - viewport_height).max(0.0);
 
         self.scroll_offset = self.scroll_offset.clamp(0.0, max_scroll);
@@ -1365,7 +1407,7 @@ impl Render for TextEditor {
             .text_color(rgb(0xd4d4d4))
             .p_4()
             .font_family("monospace")
-            .text_sm()
+            .text_size(px(self.font_size()))
             .child(div().mb_2().text_color(rgb(0x808080)).child(format!(
                         "MedleyText - {} | Ctrl+P: files | Ctrl+S: save | Ctrl+Q: quit",
                         self.current_file
@@ -1394,7 +1436,9 @@ impl Render for TextEditor {
 
                             let tokens = MarkdownHighlighter::tokenize_line(line);
 
-                            let mut line_div = div().flex().flex_row().min_h(px(18.0));
+                            let content_line_height = self.cursor_height();
+                            let mut line_div =
+                                div().flex().flex_row().min_h(px(content_line_height));
                             let mut char_count = 0;
 
                             for (text, token_type) in tokens {
@@ -1419,7 +1463,10 @@ impl Render for TextEditor {
                                     match segment {
                                         SegmentPiece::Cursor => {
                                             line_div = line_div.child(
-                                                div().w(px(4.0)).h(px(18.0)).bg(rgb(0xcccccc)),
+                                                div()
+                                                    .w(px(4.0))
+                                                    .h(px(content_line_height))
+                                                    .bg(rgb(0xcccccc)),
                                             );
                                         }
                                         SegmentPiece::Text(run) => {
@@ -1441,8 +1488,12 @@ impl Render for TextEditor {
                             if cursor_on_line {
                                 let cursor_col = self.cursor_position - line_start;
                                 if cursor_col == line.len() {
-                                    line_div = line_div
-                                        .child(div().w(px(4.0)).h(px(18.0)).bg(rgb(0xcccccc)));
+                                    line_div = line_div.child(
+                                        div()
+                                            .w(px(4.0))
+                                            .h(px(content_line_height))
+                                            .bg(rgb(0xcccccc)),
+                                    );
                                 }
                             }
 
@@ -1504,7 +1555,7 @@ impl Render for TextEditor {
                     )
                     .child(
                         div()
-                            .text_sm()
+                            .text_size(px(self.font_size()))
                             .font_family("monospace")
                             .text_color(text_color)
                             .child(display),
@@ -1521,9 +1572,9 @@ impl Render for TextEditor {
             };
 
             let find_overlay = div()
-                .absolute()
-                .top(px(20.0))
-                .right(px(20.0))
+                    .absolute()
+                    .top(px(self.padding()))
+                    .right(px(self.padding()))
                 .w(px(360.0))
                 .bg(rgb(0x1f1f1f))
                 .border_1()
@@ -1572,9 +1623,9 @@ impl Render for TextEditor {
             let suggestions = autocomplete.get_suggestions_display();
 
             // Calculate cursor position for positioning the dropdown
-            let line_height = 22.0;
-            let header_height = 30.0;
-            let padding = 16.0;
+            let line_height = self.line_height();
+            let header_height = self.header_height();
+            let padding = self.padding();
             let current_line = self.get_current_line_number() as f32 - 1.0;
             let top = padding + header_height + (current_line * line_height) + line_height
                 - self.scroll_offset;
@@ -1604,7 +1655,7 @@ impl Render for TextEditor {
                         .justify_between()
                         .child(
                             div()
-                                .text_sm()
+                                .text_size(px(self.font_size()))
                                 .font_family("monospace")
                                 .text_color(crate::autocomplete::Autocomplete::item_text_color(
                                     *is_selected,

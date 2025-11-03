@@ -34,6 +34,16 @@ medleytext demo.md
 - `Enter` - Open selected file
 - `Esc` - Close palette
 
+## Configuration
+
+MedleyText reads optional settings from `~/.config/medleytext/config`. Configuration is line-based using `key=value` entries.
+
+```
+font-size=16
+```
+
+If the file is missing or the value cannot be parsed, the editor falls back to the default 14px font size.
+
 ## Documentation
 
 Built with [GPUI](https://docs.rs/gpui/latest/gpui/), a GPU-accelerated UI framework for Rust.

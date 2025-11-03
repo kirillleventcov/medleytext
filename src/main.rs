@@ -4,11 +4,13 @@
 //! key binding configuration, and window creation.
 
 mod autocomplete;
+mod config;
 mod editor;
 mod find;
 mod markdown;
 mod palette;
 
+use config::EditorConfig;
 use editor::TextEditor;
 use gpui::{
     App, AppContext, Application, Bounds, KeyBinding, WindowBounds, WindowOptions, px, size,
@@ -32,6 +34,7 @@ use gpui::{
 fn main() {
     let args: Vec<String> = std::env::args().collect();
     let file_path = args.get(1).cloned();
+    let editor_config = EditorConfig::load();
 
     Application::new().run(move |cx: &mut App| {
         use editor::{
@@ -70,12 +73,15 @@ fn main() {
         // Consider making window size configurable via config file in future iterations.
         let bounds = Bounds::centered(None, size(px(800.0), px(600.0)), cx);
         let file_path_clone = file_path.clone();
+        let config_for_window = editor_config.clone();
         cx.open_window(
             WindowOptions {
                 window_bounds: Some(WindowBounds::Windowed(bounds)),
                 ..Default::default()
             },
-            |_window, cx| cx.new(|cx| TextEditor::with_file(file_path_clone, cx)),
+            |_window, cx| {
+                cx.new(|cx| TextEditor::with_file(file_path_clone, config_for_window, cx))
+            },
         )
         .unwrap();
     });
