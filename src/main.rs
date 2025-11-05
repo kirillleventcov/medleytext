@@ -64,6 +64,7 @@ fn main() {
             KeyBinding::new("shift-down", SelectDown, None),
             KeyBinding::new("ctrl-a", SelectAll, None),
             KeyBinding::new("ctrl-p", TogglePalette, None),
+            KeyBinding::new("ctrl-o", TogglePalette, None),
             KeyBinding::new("ctrl-f", ToggleFind, None),
             KeyBinding::new("f3", FindNext, None),
             KeyBinding::new("shift-f3", FindPrevious, None),

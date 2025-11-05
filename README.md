@@ -19,7 +19,7 @@ medleytext demo.md
 
 **Keybindings:**
 
-- `Ctrl+P` - Open fuzzy file finder
+- `Ctrl+O` / `Ctrl+P` - Open fuzzy file finder
 - `Ctrl+S` - Save
 - `Ctrl+Q` - Quit
 - `Ctrl+A` - Select all
