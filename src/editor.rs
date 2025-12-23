@@ -24,6 +24,10 @@ actions!(
         MoveRight,
         MoveUp,
         MoveDown,
+        MoveWordLeft,
+        MoveWordRight,
+        MoveHome,
+        MoveEnd,
         Backspace,
         Enter,
         Save,
@@ -40,8 +44,27 @@ actions!(
         FindNext,
         FindPrevious,
         TogglePalette,
+        Undo,
+        Redo,
     ]
 );
+
+/// Represents a single edit operation for undo/redo.
+#[derive(Clone, Debug)]
+struct EditOperation {
+    /// Content before the edit
+    old_content: String,
+    /// Content after the edit
+    new_content: String,
+    /// Cursor position before the edit
+    old_cursor: usize,
+    /// Cursor position after the edit
+    new_cursor: usize,
+    /// Selection start before the edit
+    old_selection: Option<usize>,
+    /// Selection start after the edit
+    new_selection: Option<usize>,
+}
 
 /// Core text editor component.
 ///
@@ -54,13 +77,12 @@ actions!(
 /// - **Selection Model**: Anchor-based selection with `selection_start` and `cursor_position` endpoints
 /// - **Scrolling**: Pixel-based vertical scroll offset, clamped to content bounds
 /// - **Rendering**: Token-based rendering with per-token color application from markdown highlighter
+/// - **Undo/Redo**: Stack-based undo/redo with full state capture per operation
 ///
 /// # Future Improvements
 ///
 /// - Replace `String` with rope data structure for better performance on large files
-/// - Add undo/redo stack
 /// - Implement multi-cursor support
-/// - Add line numbers in gutter
 /// - Consider caching tokenized lines for better rendering performance
 pub struct TextEditor {
     /// Full document content as UTF-8 string. Consider rope data structure for large files.
@@ -101,6 +123,12 @@ pub struct TextEditor {
 
     /// Editor configuration loaded from disk.
     config: EditorConfig,
+
+    /// Undo stack for reverting changes.
+    undo_stack: Vec<EditOperation>,
+
+    /// Redo stack for reapplying undone changes.
+    redo_stack: Vec<EditOperation>,
 }
 
 #[derive(Clone)]
@@ -221,6 +249,8 @@ impl TextEditor {
             find_panel: None,
             suppress_next_enter: false,
             config,
+            undo_stack: Vec::new(),
+            redo_stack: Vec::new(),
         }
     }
 
@@ -254,6 +284,137 @@ impl TextEditor {
 
     fn viewport_height(&self) -> f32 {
         538.0 - 20.0 + self.line_height()
+    }
+
+    /// Records an edit operation to the undo stack.
+    ///
+    /// This captures the state before and after an edit, allowing it to be undone later.
+    /// When a new edit is recorded, the redo stack is cleared.
+    fn push_edit(&mut self, old_content: String, old_cursor: usize, old_selection: Option<usize>) {
+        let operation = EditOperation {
+            old_content,
+            new_content: self.content.clone(),
+            old_cursor,
+            new_cursor: self.cursor_position,
+            old_selection,
+            new_selection: self.selection_start,
+        };
+        self.undo_stack.push(operation);
+        self.redo_stack.clear();
+    }
+
+    /// Finds the position of the previous word boundary from the current cursor position.
+    ///
+    /// Word boundaries are defined as transitions between alphanumeric and non-alphanumeric characters.
+    fn find_prev_word_boundary(&self) -> usize {
+        if self.cursor_position == 0 {
+            return 0;
+        }
+
+        let chars: Vec<char> = self.content.chars().collect();
+
+        // Convert byte offset to char index
+        let mut char_pos = 0;
+        for (i, _) in self.content.char_indices() {
+            if i >= self.cursor_position {
+                break;
+            }
+            char_pos += 1;
+        }
+
+        // Skip trailing whitespace
+        while char_pos > 0 && chars[char_pos - 1].is_whitespace() {
+            char_pos -= 1;
+        }
+
+        if char_pos == 0 {
+            return 0;
+        }
+
+        // Determine the type of the current character
+        let is_alphanum = chars[char_pos - 1].is_alphanumeric() || chars[char_pos - 1] == '_';
+
+        // Move back to the start of the word
+        while char_pos > 0 {
+            let prev_is_alphanum =
+                chars[char_pos - 1].is_alphanumeric() || chars[char_pos - 1] == '_';
+            if prev_is_alphanum != is_alphanum {
+                break;
+            }
+            char_pos -= 1;
+        }
+
+        // Convert char index back to byte offset
+        self.content
+            .char_indices()
+            .nth(char_pos)
+            .map(|(i, _)| i)
+            .unwrap_or(0)
+    }
+
+    /// Finds the position of the next word boundary from the current cursor position.
+    ///
+    /// Word boundaries are defined as transitions between alphanumeric and non-alphanumeric characters.
+    fn find_next_word_boundary(&self) -> usize {
+        let len = self.content.len();
+        if self.cursor_position >= len {
+            return len;
+        }
+
+        let chars: Vec<char> = self.content.chars().collect();
+
+        // Convert byte offset to char index
+        let mut char_pos = 0;
+        for (i, _) in self.content.char_indices() {
+            if i >= self.cursor_position {
+                break;
+            }
+            char_pos += 1;
+        }
+
+        if char_pos >= chars.len() {
+            return len;
+        }
+
+        // Determine the type of the current character
+        let is_alphanum = chars[char_pos].is_alphanumeric() || chars[char_pos] == '_';
+
+        // Move forward to the end of the word
+        while char_pos < chars.len() {
+            let curr_is_alphanum = chars[char_pos].is_alphanumeric() || chars[char_pos] == '_';
+            if curr_is_alphanum != is_alphanum {
+                break;
+            }
+            char_pos += 1;
+        }
+
+        // Skip leading whitespace of the next word
+        while char_pos < chars.len() && chars[char_pos].is_whitespace() {
+            char_pos += 1;
+        }
+
+        // Convert char index back to byte offset
+        self.content
+            .char_indices()
+            .nth(char_pos)
+            .map(|(i, _)| i)
+            .unwrap_or(len)
+    }
+
+    /// Finds the start of the current line (byte offset).
+    fn find_line_start(&self) -> usize {
+        self.content[..self.cursor_position]
+            .rfind('\n')
+            .map(|pos| pos + 1)
+            .unwrap_or(0)
+    }
+
+    /// Finds the end of the current line (byte offset).
+    fn find_line_end(&self) -> usize {
+        self.content[self.cursor_position..]
+            .find('\n')
+            .map(|pos| self.cursor_position + pos)
+            .unwrap_or(self.content.len())
     }
 
     /// Calculates the current line number (1-indexed) based on cursor position.
@@ -776,10 +937,16 @@ impl TextEditor {
     /// * `c` - Character to insert
     /// * `cx` - Context for triggering UI refresh via `notify()`
     fn insert_char(&mut self, c: char, cx: &mut Context<Self>) {
+        let old_content = self.content.clone();
+        let old_cursor = self.cursor_position;
+        let old_selection = self.selection_start;
+
         self.delete_selection();
         self.content.insert(self.cursor_position, c);
         self.cursor_position += 1;
         self.is_dirty = true;
+
+        self.push_edit(old_content, old_cursor, old_selection);
 
         // Check if this character should trigger autocomplete
         let trigger = c.to_string();
@@ -811,26 +978,39 @@ impl TextEditor {
         // Close autocomplete on backspace
         self.autocomplete = None;
 
+        let old_content = self.content.clone();
+        let old_cursor = self.cursor_position;
+        let old_selection = self.selection_start;
+
         if !self.delete_selection() {
             if self.cursor_position > 0 {
                 self.cursor_position -= 1;
                 self.content.remove(self.cursor_position);
                 self.is_dirty = true;
+            } else {
+                return; // Nothing to delete, don't record
             }
         } else {
             self.is_dirty = true;
         }
+
+        self.push_edit(old_content, old_cursor, old_selection);
         self.refresh_search_matches();
         cx.notify();
     }
 
     /// Handles Enter key press by inserting a newline at cursor position.
     /// If autocomplete is active, accepts the selected suggestion instead.
+    /// Implements smart list continuation for markdown lists.
     fn handle_enter(&mut self, _: &Enter, _: &mut Window, cx: &mut Context<Self>) {
         if self.suppress_next_enter {
             self.suppress_next_enter = false;
             return;
         }
+
+        let old_content = self.content.clone();
+        let old_cursor = self.cursor_position;
+        let old_selection = self.selection_start;
 
         // If autocomplete is active, accept the selected suggestion
         if let Some(autocomplete) = &self.autocomplete {
@@ -846,6 +1026,7 @@ impl TextEditor {
                 self.content.insert_str(line_start, &suggestion.insert_text);
                 self.cursor_position = line_start + suggestion.insert_text.len();
                 self.is_dirty = true;
+                self.push_edit(old_content, old_cursor, old_selection);
             }
             self.autocomplete = None;
             self.refresh_search_matches();
@@ -853,9 +1034,111 @@ impl TextEditor {
             return;
         }
 
-        self.content.insert(self.cursor_position, '\n');
-        self.cursor_position += 1;
+        // Smart list continuation
+        let line_start = self.find_line_start();
+        let line_content = &self.content[line_start..self.cursor_position];
+
+        // Check for different list patterns
+        let list_marker = if let Some(rest) = line_content.strip_prefix("- ") {
+            if rest.trim().is_empty() {
+                // Empty list item, remove the marker
+                self.content.drain(line_start..self.cursor_position);
+                self.cursor_position = line_start;
+                self.is_dirty = true;
+                self.push_edit(old_content, old_cursor, old_selection);
+                self.refresh_search_matches();
+                cx.notify();
+                return;
+            }
+            Some(String::from("- "))
+        } else if let Some(rest) = line_content.strip_prefix("* ") {
+            if rest.trim().is_empty() {
+                self.content.drain(line_start..self.cursor_position);
+                self.cursor_position = line_start;
+                self.is_dirty = true;
+                self.push_edit(old_content, old_cursor, old_selection);
+                self.refresh_search_matches();
+                cx.notify();
+                return;
+            }
+            Some(String::from("* "))
+        } else if let Some(rest) = line_content.strip_prefix("+ ") {
+            if rest.trim().is_empty() {
+                self.content.drain(line_start..self.cursor_position);
+                self.cursor_position = line_start;
+                self.is_dirty = true;
+                self.push_edit(old_content, old_cursor, old_selection);
+                self.refresh_search_matches();
+                cx.notify();
+                return;
+            }
+            Some(String::from("+ "))
+        } else if let Some(rest) = line_content.strip_prefix("- [ ] ") {
+            if rest.trim().is_empty() {
+                self.content.drain(line_start..self.cursor_position);
+                self.cursor_position = line_start;
+                self.is_dirty = true;
+                self.push_edit(old_content, old_cursor, old_selection);
+                self.refresh_search_matches();
+                cx.notify();
+                return;
+            }
+            Some(String::from("- [ ] "))
+        } else if let Some(rest) = line_content.strip_prefix("- [x] ") {
+            if rest.trim().is_empty() {
+                self.content.drain(line_start..self.cursor_position);
+                self.cursor_position = line_start;
+                self.is_dirty = true;
+                self.push_edit(old_content, old_cursor, old_selection);
+                self.refresh_search_matches();
+                cx.notify();
+                return;
+            }
+            // Continue with unchecked checkbox
+            Some(String::from("- [ ] "))
+        } else {
+            // Check for numbered lists (e.g., "1. ", "42. ")
+            let trimmed = line_content.trim_start();
+            if let Some(dot_pos) = trimmed.find(". ") {
+                let num_part = &trimmed[..dot_pos];
+                if num_part.chars().all(|c| c.is_ascii_digit()) {
+                    let rest = &trimmed[dot_pos + 2..];
+                    if rest.trim().is_empty() {
+                        // Empty numbered item, remove it
+                        self.content.drain(line_start..self.cursor_position);
+                        self.cursor_position = line_start;
+                        self.is_dirty = true;
+                        self.push_edit(old_content, old_cursor, old_selection);
+                        self.refresh_search_matches();
+                        cx.notify();
+                        return;
+                    }
+                    // Continue with next number
+                    if let Ok(num) = num_part.parse::<usize>() {
+                        Some(format!("{}. ", num + 1))
+                    } else {
+                        None
+                    }
+                } else {
+                    None
+                }
+            } else {
+                None
+            }
+        };
+
+        if let Some(marker) = list_marker {
+            self.content.insert(self.cursor_position, '\n');
+            self.cursor_position += 1;
+            self.content.insert_str(self.cursor_position, &marker);
+            self.cursor_position += marker.len();
+        } else {
+            self.content.insert(self.cursor_position, '\n');
+            self.cursor_position += 1;
+        }
+
         self.is_dirty = true;
+        self.push_edit(old_content, old_cursor, old_selection);
         self.refresh_search_matches();
         cx.notify();
     }
@@ -911,6 +1194,47 @@ impl TextEditor {
 
         self.clear_selection();
         self.move_down_internal();
+        cx.notify();
+    }
+
+    /// Moves cursor to the previous word boundary.
+    /// Clears any active selection.
+    fn handle_move_word_left(&mut self, _: &MoveWordLeft, _: &mut Window, cx: &mut Context<Self>) {
+        self.autocomplete = None;
+        self.clear_selection();
+        self.cursor_position = self.find_prev_word_boundary();
+        cx.notify();
+    }
+
+    /// Moves cursor to the next word boundary.
+    /// Clears any active selection.
+    fn handle_move_word_right(
+        &mut self,
+        _: &MoveWordRight,
+        _: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.autocomplete = None;
+        self.clear_selection();
+        self.cursor_position = self.find_next_word_boundary();
+        cx.notify();
+    }
+
+    /// Moves cursor to the start of the current line.
+    /// Clears any active selection.
+    fn handle_move_home(&mut self, _: &MoveHome, _: &mut Window, cx: &mut Context<Self>) {
+        self.autocomplete = None;
+        self.clear_selection();
+        self.cursor_position = self.find_line_start();
+        cx.notify();
+    }
+
+    /// Moves cursor to the end of the current line.
+    /// Clears any active selection.
+    fn handle_move_end(&mut self, _: &MoveEnd, _: &mut Window, cx: &mut Context<Self>) {
+        self.autocomplete = None;
+        self.clear_selection();
+        self.cursor_position = self.find_line_end();
         cx.notify();
     }
 
@@ -978,10 +1302,15 @@ impl TextEditor {
     fn handle_paste(&mut self, _: &Paste, _: &mut Window, cx: &mut Context<Self>) {
         if let Some(clipboard_item) = cx.read_from_clipboard() {
             if let Some(text) = clipboard_item.text().map(|s| s.to_string()) {
+                let old_content = self.content.clone();
+                let old_cursor = self.cursor_position;
+                let old_selection = self.selection_start;
+
                 self.delete_selection();
                 self.content.insert_str(self.cursor_position, &text);
                 self.cursor_position += text.len();
                 self.is_dirty = true;
+                self.push_edit(old_content, old_cursor, old_selection);
                 self.refresh_search_matches();
                 cx.notify();
             }
@@ -992,9 +1321,14 @@ impl TextEditor {
     /// Copies selected text to clipboard and deletes it. Does nothing if no selection.
     fn handle_cut(&mut self, _: &Cut, _: &mut Window, cx: &mut Context<Self>) {
         if let Some(text) = self.get_selected_text() {
+            let old_content = self.content.clone();
+            let old_cursor = self.cursor_position;
+            let old_selection = self.selection_start;
+
             cx.write_to_clipboard(ClipboardItem::new_string(text));
             self.delete_selection();
             self.is_dirty = true;
+            self.push_edit(old_content, old_cursor, old_selection);
             self.refresh_search_matches();
             cx.notify();
         }
@@ -1115,6 +1449,34 @@ impl TextEditor {
             self.palette = Some(palette_entity);
         }
         cx.notify();
+    }
+
+    /// Handles Ctrl+Z (Undo) action.
+    /// Reverts the last edit operation and moves it to the redo stack.
+    fn handle_undo(&mut self, _: &Undo, _: &mut Window, cx: &mut Context<Self>) {
+        if let Some(operation) = self.undo_stack.pop() {
+            self.content = operation.old_content.clone();
+            self.cursor_position = operation.old_cursor;
+            self.selection_start = operation.old_selection;
+            self.redo_stack.push(operation);
+            self.is_dirty = true;
+            self.refresh_search_matches();
+            cx.notify();
+        }
+    }
+
+    /// Handles Ctrl+Shift+Z or Ctrl+Y (Redo) action.
+    /// Reapplies an undone edit operation.
+    fn handle_redo(&mut self, _: &Redo, _: &mut Window, cx: &mut Context<Self>) {
+        if let Some(operation) = self.redo_stack.pop() {
+            self.content = operation.new_content.clone();
+            self.cursor_position = operation.new_cursor;
+            self.selection_start = operation.new_selection;
+            self.undo_stack.push(operation);
+            self.is_dirty = true;
+            self.refresh_search_matches();
+            cx.notify();
+        }
     }
 
     /// Loads a file into the editor.
@@ -1358,6 +1720,10 @@ impl Render for TextEditor {
             .on_action(cx.listener(Self::handle_move_right))
             .on_action(cx.listener(Self::handle_move_up))
             .on_action(cx.listener(Self::handle_move_down))
+            .on_action(cx.listener(Self::handle_move_word_left))
+            .on_action(cx.listener(Self::handle_move_word_right))
+            .on_action(cx.listener(Self::handle_move_home))
+            .on_action(cx.listener(Self::handle_move_end))
             .on_action(cx.listener(Self::handle_backspace))
             .on_action(cx.listener(Self::handle_enter))
             .on_action(cx.listener(Self::handle_save))
@@ -1374,6 +1740,8 @@ impl Render for TextEditor {
             .on_action(cx.listener(Self::handle_find_next))
             .on_action(cx.listener(Self::handle_find_previous))
             .on_action(cx.listener(Self::handle_toggle_palette))
+            .on_action(cx.listener(Self::handle_undo))
+            .on_action(cx.listener(Self::handle_redo))
             .on_key_down(cx.listener(|editor, event: &KeyDownEvent, _, cx| {
                 if editor.handle_find_key_event(event, cx) {
                     return;
@@ -1439,8 +1807,11 @@ impl Render for TextEditor {
                         let mut current_pos = 0;
                         let mut result = div().flex().flex_col();
                         let selection_range = self.get_selection_range();
+                        let total_lines = lines.len();
+                        let gutter_width =
+                            (total_lines.to_string().len() as f32 * self.char_width()) + 16.0;
 
-                        for line in lines {
+                        for (line_number, line) in lines.iter().enumerate() {
                             let line_start = current_pos;
                             let line_end = current_pos + line.len();
                             let cursor_on_line = self.cursor_position >= line_start
@@ -1449,6 +1820,23 @@ impl Render for TextEditor {
                             let tokens = MarkdownHighlighter::tokenize_line(line);
 
                             let content_line_height = self.cursor_height();
+
+                            // Create a wrapper for the entire line (gutter + content)
+                            let mut line_wrapper =
+                                div().flex().flex_row().min_h(px(content_line_height));
+
+                            // Add line number gutter
+                            line_wrapper = line_wrapper.child(
+                                div()
+                                    .w(px(gutter_width))
+                                    .flex()
+                                    .justify_end()
+                                    .pr_2()
+                                    .text_color(theme.editor.muted_text)
+                                    .child(format!("{}", line_number + 1)),
+                            );
+
+                            // Create the content div
                             let mut line_div =
                                 div().flex().flex_row().min_h(px(content_line_height));
                             let mut char_count = 0;
@@ -1511,7 +1899,8 @@ impl Render for TextEditor {
                                 }
                             }
 
-                            result = result.child(line_div);
+                            line_wrapper = line_wrapper.child(line_div);
+                            result = result.child(line_wrapper);
                             current_pos = line_end + 1;
                         }
 

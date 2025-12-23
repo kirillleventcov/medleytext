@@ -38,9 +38,10 @@ fn main() {
 
     Application::new().run(move |cx: &mut App| {
         use editor::{
-            Backspace, Copy, Cut, Enter, FindNext, FindPrevious, MoveDown, MoveLeft, MoveRight,
-            MoveUp, Paste, Quit, Save, SelectAll, SelectDown, SelectLeft, SelectRight, SelectUp,
-            ToggleFind, TogglePalette,
+            Backspace, Copy, Cut, Enter, FindNext, FindPrevious, MoveDown, MoveEnd, MoveHome,
+            MoveLeft, MoveRight, MoveUp, MoveWordLeft, MoveWordRight, Paste, Quit, Redo, Save,
+            SelectAll, SelectDown, SelectLeft, SelectRight, SelectUp, ToggleFind, TogglePalette,
+            Undo,
         };
 
         // Configure global keybindings for the application.
@@ -51,6 +52,10 @@ fn main() {
             KeyBinding::new("right", MoveRight, None),
             KeyBinding::new("up", MoveUp, None),
             KeyBinding::new("down", MoveDown, None),
+            KeyBinding::new("ctrl-left", MoveWordLeft, None),
+            KeyBinding::new("ctrl-right", MoveWordRight, None),
+            KeyBinding::new("home", MoveHome, None),
+            KeyBinding::new("end", MoveEnd, None),
             KeyBinding::new("backspace", Backspace, None),
             KeyBinding::new("enter", Enter, None),
             KeyBinding::new("ctrl-s", Save, None),
@@ -68,16 +73,19 @@ fn main() {
             KeyBinding::new("ctrl-f", ToggleFind, None),
             KeyBinding::new("f3", FindNext, None),
             KeyBinding::new("shift-f3", FindPrevious, None),
+            KeyBinding::new("ctrl-z", Undo, None),
+            KeyBinding::new("ctrl-shift-z", Redo, None),
+            KeyBinding::new("ctrl-y", Redo, None),
         ]);
 
-        // Create a centered window with fixed dimensions (800x600).
-        // Consider making window size configurable via config file in future iterations.
+        // Create a resizable window centered on screen with initial size of 800x600.
         let bounds = Bounds::centered(None, size(px(800.0), px(600.0)), cx);
         let file_path_clone = file_path.clone();
         let config_for_window = editor_config.clone();
         cx.open_window(
             WindowOptions {
                 window_bounds: Some(WindowBounds::Windowed(bounds)),
+                is_movable: true,
                 ..Default::default()
             },
             |_window, cx| {

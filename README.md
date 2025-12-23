@@ -34,6 +34,16 @@ medleytext demo.md
 - `Enter` - Open selected file
 - `Esc` - Close palette
 
+## Building
+
+### MacOS Notes
+
+Follow [Zed's Guide on MacOS building](https://github.com/zed-industries/zed/blob/main/docs/src/development/macos.md) to install the necessary dependencies.
+
+```bash
+cargo build --release
+```
+
 ## Configuration
 
 MedleyText reads optional settings from `~/.config/medleytext/config`. Each non-empty line uses either `key=value` or `key: value`. Lines beginning with `#` or `//` are ignored.
