@@ -29,7 +29,10 @@ actions!(
         MoveHome,
         MoveEnd,
         Backspace,
+        Delete,
         Enter,
+        Tab,
+        ShiftTab,
         Save,
         Quit,
         Copy,
@@ -43,6 +46,7 @@ actions!(
         ToggleFind,
         FindNext,
         FindPrevious,
+        ToggleGoToLine,
         TogglePalette,
         Undo,
         Redo,
@@ -129,6 +133,18 @@ pub struct TextEditor {
 
     /// Redo stack for reapplying undone changes.
     redo_stack: Vec<EditOperation>,
+
+    /// Go-to-line panel input. None when closed.
+    goto_panel: Option<String>,
+
+    /// Tracks whether the mouse is being dragged for selection.
+    is_dragging: bool,
+
+    /// Starting cursor position for a mouse drag selection.
+    drag_start_position: usize,
+
+    /// Cached window width for word-wrap calculations.
+    window_width: f32,
 }
 
 #[derive(Clone)]
@@ -251,6 +267,10 @@ impl TextEditor {
             config,
             undo_stack: Vec::new(),
             redo_stack: Vec::new(),
+            goto_panel: None,
+            is_dragging: false,
+            drag_start_position: 0,
+            window_width: 800.0,
         }
     }
 
@@ -284,6 +304,25 @@ impl TextEditor {
 
     fn viewport_height(&self) -> f32 {
         538.0 - 20.0 + self.line_height()
+    }
+
+    fn gutter_width(&self) -> f32 {
+        let total_lines = self.content.split('\n').count();
+        (total_lines.to_string().len() as f32 * self.char_width()) + 16.0
+    }
+
+    fn text_area_width(&self) -> f32 {
+        (self.window_width - self.padding() * 2.0 - self.gutter_width() - 8.0).max(100.0)
+    }
+
+    fn chars_per_line(&self) -> usize {
+        let width = self.text_area_width();
+        let cw = self.char_width();
+        if cw <= 0.0 {
+            80
+        } else {
+            (width / cw).max(10.0) as usize
+        }
     }
 
     /// Records an edit operation to the undo stack.
@@ -496,11 +535,10 @@ impl TextEditor {
     fn ensure_position_visible(&mut self, byte_offset: usize) {
         let line_height = self.line_height();
         let viewport_height = self.viewport_height();
-        let mut consumed = 0;
+        let visual_lines = self.build_visual_lines();
 
-        for (idx, line) in self.content.split('\n').enumerate() {
-            let line_len = line.len();
-            if byte_offset <= consumed + line_len {
+        for (idx, vl) in visual_lines.iter().enumerate() {
+            if byte_offset >= vl.start_byte_in_content && byte_offset <= vl.end_byte_in_content {
                 let top = idx as f32 * line_height;
                 let bottom = top + line_height;
                 let viewport_top = self.scroll_offset;
@@ -513,7 +551,6 @@ impl TextEditor {
                 }
                 break;
             }
-            consumed += line_len + 1;
         }
     }
 
@@ -999,6 +1036,35 @@ impl TextEditor {
         cx.notify();
     }
 
+    /// Handles Delete key press (forward delete).
+    ///
+    /// Behavior:
+    /// - If selection exists: delete selected text
+    /// - Otherwise: delete character after cursor
+    /// - Does nothing if cursor is at document end
+    fn handle_delete(&mut self, _: &Delete, _: &mut Window, cx: &mut Context<Self>) {
+        self.autocomplete = None;
+
+        let old_content = self.content.clone();
+        let old_cursor = self.cursor_position;
+        let old_selection = self.selection_start;
+
+        if !self.delete_selection() {
+            if self.cursor_position < self.content.len() {
+                self.content.remove(self.cursor_position);
+                self.is_dirty = true;
+            } else {
+                return; // Nothing to delete, don't record
+            }
+        } else {
+            self.is_dirty = true;
+        }
+
+        self.push_edit(old_content, old_cursor, old_selection);
+        self.refresh_search_matches();
+        cx.notify();
+    }
+
     /// Handles Enter key press by inserting a newline at cursor position.
     /// If autocomplete is active, accepts the selected suggestion instead.
     /// Implements smart list continuation for markdown lists.
@@ -1141,6 +1207,132 @@ impl TextEditor {
         self.push_edit(old_content, old_cursor, old_selection);
         self.refresh_search_matches();
         cx.notify();
+    }
+
+    /// Handles Tab key press.
+    ///
+    /// Behavior:
+    /// - If selection spans multiple lines: indent each selected line by 2 spaces
+    /// - Otherwise: insert 2 spaces at cursor
+    fn handle_tab(&mut self, _: &Tab, _: &mut Window, cx: &mut Context<Self>) {
+        self.autocomplete = None;
+
+        let old_content = self.content.clone();
+        let old_cursor = self.cursor_position;
+        let old_selection = self.selection_start;
+
+        if let Some((sel_start, sel_end)) = self.get_selection_range() {
+            // Multi-line indent: find line starts in selection and indent each
+            let start_line = self.content[..sel_start].rfind('\n').map(|p| p + 1).unwrap_or(0);
+            let _end_line = self.content[..sel_end].rfind('\n').map(|p| p + 1).unwrap_or(0);
+
+            let mut insertions = Vec::new();
+            let mut pos = start_line;
+            while pos <= sel_end {
+                insertions.push(pos);
+                if let Some(next) = self.content[pos..].find('\n') {
+                    pos += next + 1;
+                    if pos > sel_end && pos > self.content.len() {
+                        break;
+                    }
+                } else {
+                    break;
+                }
+            }
+
+            // Apply insertions in reverse to preserve offsets
+            let mut shift = 0;
+            for &insert_pos in &insertions {
+                self.content.insert_str(insert_pos + shift, "  ");
+                shift += 2;
+            }
+
+            self.cursor_position = old_cursor + if old_cursor >= start_line { 2 } else { 0 };
+            if let Some(ref mut sel) = self.selection_start {
+                *sel = old_selection.unwrap() + if old_selection.unwrap() >= start_line { 2 } else { 0 };
+            }
+            // Adjust selection end
+            let sel_end_new = sel_end + shift;
+            self.selection_start = Some(sel_end_new);
+            self.cursor_position = sel_end_new;
+            self.is_dirty = true;
+            self.push_edit(old_content, old_cursor, old_selection);
+            self.refresh_search_matches();
+            cx.notify();
+            return;
+        }
+
+        // Single-line: insert 2 spaces
+        self.content.insert_str(self.cursor_position, "  ");
+        self.cursor_position += 2;
+        self.is_dirty = true;
+        self.push_edit(old_content, old_cursor, old_selection);
+        self.refresh_search_matches();
+        cx.notify();
+    }
+
+    /// Handles Shift+Tab key press (unindent).
+    ///
+    /// Behavior:
+    /// - If selection spans multiple lines: unindent each selected line by up to 2 spaces
+    /// - Otherwise: remove up to 2 spaces before cursor
+    fn handle_shift_tab(&mut self, _: &ShiftTab, _: &mut Window, cx: &mut Context<Self>) {
+        self.autocomplete = None;
+
+        let old_content = self.content.clone();
+        let old_cursor = self.cursor_position;
+        let old_selection = self.selection_start;
+
+        if let Some((sel_start, sel_end)) = self.get_selection_range() {
+            let start_line = self.content[..sel_start].rfind('\n').map(|p| p + 1).unwrap_or(0);
+
+            let mut removals = Vec::new();
+            let mut pos = start_line;
+            while pos <= sel_end && pos < self.content.len() {
+                let line_end = self.content[pos..].find('\n').map(|p| pos + p).unwrap_or(self.content.len());
+                let line_text = &self.content[pos..line_end];
+                let spaces = line_text.chars().take_while(|c| *c == ' ').count();
+                let remove = spaces.min(2);
+                if remove > 0 {
+                    removals.push((pos, remove));
+                }
+                pos = line_end + 1;
+            }
+
+            let mut shift = 0;
+            for &(remove_pos, remove_count) in removals.iter().rev() {
+                self.content.drain(remove_pos + shift..remove_pos + shift + remove_count);
+                shift -= remove_count;
+            }
+
+            self.cursor_position = old_cursor.saturating_sub(if old_cursor > start_line { 2 } else { 0 });
+            if let Some(ref mut sel) = self.selection_start {
+                let old = old_selection.unwrap();
+                *sel = old.saturating_sub(if old > start_line { 2 } else { 0 });
+            }
+            self.is_dirty = true;
+            self.push_edit(old_content, old_cursor, old_selection);
+            self.refresh_search_matches();
+            cx.notify();
+            return;
+        }
+
+        // Single-line: remove up to 2 spaces before cursor
+        let line_start = self.find_line_start();
+        let spaces_before = self.content[line_start..self.cursor_position]
+            .chars()
+            .rev()
+            .take_while(|c| *c == ' ')
+            .count()
+            .min(2);
+        if spaces_before > 0 {
+            self.cursor_position -= spaces_before;
+            self.content.drain(self.cursor_position..self.cursor_position + spaces_before);
+            self.is_dirty = true;
+            self.push_edit(old_content, old_cursor, old_selection);
+            self.refresh_search_matches();
+            cx.notify();
+        }
     }
 
     /// Moves cursor left by one character.
@@ -1479,6 +1671,44 @@ impl TextEditor {
         }
     }
 
+    /// Toggles the go-to-line panel.
+    fn handle_toggle_goto_line(
+        &mut self,
+        _: &ToggleGoToLine,
+        _: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if self.goto_panel.is_some() {
+            self.goto_panel = None;
+        } else {
+            self.goto_panel = Some(String::new());
+        }
+        cx.notify();
+    }
+
+    /// Commits a go-to-line jump.
+    fn goto_line_commit(&mut self) {
+        if let Some(ref input) = self.goto_panel {
+            if let Ok(line_num) = input.parse::<usize>() {
+                let target = line_num.saturating_sub(1);
+                let lines: Vec<&str> = self.content.split('\n').collect();
+                if target < lines.len() {
+                    let mut byte_pos = 0;
+                    for (idx, line) in lines.iter().enumerate() {
+                        if idx == target {
+                            self.cursor_position = byte_pos;
+                            self.selection_start = None;
+                            self.ensure_position_visible(byte_pos);
+                            break;
+                        }
+                        byte_pos += line.len() + 1;
+                    }
+                }
+            }
+        }
+        self.goto_panel = None;
+    }
+
     /// Loads a file into the editor.
     ///
     /// This method reads the file content and updates the editor state.
@@ -1545,7 +1775,49 @@ impl TextEditor {
         }
 
         self.cursor_position = byte_position;
+        self.is_dragging = true;
+        self.drag_start_position = byte_position;
         cx.notify();
+    }
+
+    /// Handles mouse move events for drag-to-select.
+    fn handle_mouse_move(&mut self, event: &gpui::MouseMoveEvent, cx: &mut Context<Self>) {
+        if !self.is_dragging {
+            return;
+        }
+
+        let char_width = px(self.char_width());
+        let line_height = px(self.line_height());
+        let header_height = px(self.header_height());
+        let padding = px(self.padding());
+
+        let move_x = event.position.x - padding;
+        let move_y = event.position.y - padding - header_height + px(self.scroll_offset);
+
+        let moved_line = ((move_y / line_height).max(0.0).floor() as usize).max(0);
+        let moved_col = ((move_x / char_width).max(0.0).round() as usize).max(0);
+
+        let lines: Vec<&str> = self.content.split('\n').collect();
+        let target_line = moved_line.min(lines.len().saturating_sub(1));
+
+        let mut byte_position = 0;
+        for (idx, line) in lines.iter().enumerate() {
+            if idx == target_line {
+                let target_col = moved_col.min(line.len());
+                byte_position += target_col;
+                break;
+            }
+            byte_position += line.len() + 1;
+        }
+
+        self.cursor_position = byte_position;
+        self.selection_start = Some(self.drag_start_position);
+        cx.notify();
+    }
+
+    /// Handles mouse up events to end drag selection.
+    fn handle_mouse_up(&mut self, _event: &gpui::MouseUpEvent, _cx: &mut Context<Self>) {
+        self.is_dragging = false;
     }
 
     /// Handles mouse scroll wheel events for vertical scrolling.
@@ -1568,8 +1840,8 @@ impl TextEditor {
 
         self.scroll_offset -= scroll_amount;
 
-        let lines: Vec<&str> = self.content.split('\n').collect();
-        let total_content_height = lines.len() as f32 * line_height;
+        let visual_lines = self.build_visual_lines();
+        let total_content_height = visual_lines.len() as f32 * line_height;
 
         let viewport_height = self.viewport_height();
         let max_scroll = (total_content_height - viewport_height).max(0.0);
@@ -1589,33 +1861,7 @@ impl TextEditor {
     ///
     /// This logic is shared by `handle_move_up` and `handle_select_up`.
     fn move_up_internal(&mut self) {
-        let lines: Vec<&str> = self.content.split('\n').collect();
-        let mut current_pos = 0;
-        let mut current_line = 0;
-        let mut col_in_line = 0;
-
-        for (line_idx, line) in lines.iter().enumerate() {
-            if current_pos + line.len() >= self.cursor_position {
-                current_line = line_idx;
-                col_in_line = self.cursor_position - current_pos;
-                break;
-            }
-            current_pos += line.len() + 1;
-        }
-
-        if current_line > 0 {
-            let prev_line_len = lines[current_line - 1].len();
-            let new_col = col_in_line.min(prev_line_len);
-            let mut new_pos = 0;
-            for (i, line) in lines.iter().enumerate() {
-                if i == current_line - 1 {
-                    new_pos += new_col;
-                    break;
-                }
-                new_pos += line.len() + 1;
-            }
-            self.cursor_position = new_pos;
-        }
+        self.move_up_internal_wrapped();
     }
 
     /// Internal helper for moving cursor down one line while preserving column position.
@@ -1623,34 +1869,100 @@ impl TextEditor {
     /// Algorithm mirrors `move_up_internal` but moves to the next line instead.
     /// Handles edge cases like moving from long line to short line gracefully.
     fn move_down_internal(&mut self) {
+        self.move_down_internal_wrapped();
+    }
+
+    /// Builds visual lines for word-wrapped rendering.
+    fn build_visual_lines(&self) -> Vec<VisualLine> {
+        let max_chars = self.chars_per_line();
         let lines: Vec<&str> = self.content.split('\n').collect();
-        let mut current_pos = 0;
-        let mut current_line = 0;
-        let mut col_in_line = 0;
+        let mut result = Vec::new();
+        let mut content_byte = 0usize;
 
         for (line_idx, line) in lines.iter().enumerate() {
-            if current_pos + line.len() >= self.cursor_position {
-                current_line = line_idx;
-                col_in_line = self.cursor_position - current_pos;
-                break;
+            let mut char_count = 0usize;
+            let mut start_byte = 0usize;
+            let mut is_first = true;
+
+            for (byte_idx, _ch) in line.char_indices() {
+                if char_count >= max_chars && char_count > 0 {
+                    result.push(VisualLine {
+                        content_line: line_idx,
+                        start_byte_in_content: content_byte + start_byte,
+                        end_byte_in_content: content_byte + byte_idx,
+                        is_first,
+                    });
+                    start_byte = byte_idx;
+                    char_count = 0;
+                    is_first = false;
+                }
+                char_count += 1;
             }
-            current_pos += line.len() + 1;
+
+            result.push(VisualLine {
+                content_line: line_idx,
+                start_byte_in_content: content_byte + start_byte,
+                end_byte_in_content: content_byte + line.len(),
+                is_first,
+            });
+
+            content_byte += line.len() + 1;
         }
 
-        if current_line < lines.len() - 1 {
-            let next_line_len = lines[current_line + 1].len();
-            let new_col = col_in_line.min(next_line_len);
-            let mut new_pos = 0;
-            for (i, line) in lines.iter().enumerate() {
-                if i == current_line + 1 {
-                    new_pos += new_col;
-                    break;
-                }
-                new_pos += line.len() + 1;
-            }
-            self.cursor_position = new_pos;
-        }
+        result
     }
+
+    /// Finds which visual line contains the given byte offset.
+    fn byte_offset_to_visual_line(
+        &self,
+        byte_offset: usize,
+        visual_lines: &[VisualLine],
+    ) -> (usize, usize) {
+        for (idx, vl) in visual_lines.iter().enumerate() {
+            if byte_offset >= vl.start_byte_in_content && byte_offset <= vl.end_byte_in_content {
+                let col = byte_offset - vl.start_byte_in_content;
+                return (idx, col);
+            }
+        }
+        (visual_lines.len().saturating_sub(1), 0)
+    }
+
+    /// Moves cursor up one visual line (word-wrap aware).
+    fn move_up_internal_wrapped(&mut self) {
+        let visual_lines = self.build_visual_lines();
+        let (current_vl_idx, current_col) =
+            self.byte_offset_to_visual_line(self.cursor_position, &visual_lines);
+        if current_vl_idx == 0 {
+            return;
+        }
+        let prev_vl = &visual_lines[current_vl_idx - 1];
+        let vl_len = prev_vl.end_byte_in_content - prev_vl.start_byte_in_content;
+        let new_col = current_col.min(vl_len);
+        self.cursor_position = prev_vl.start_byte_in_content + new_col;
+    }
+
+    /// Moves cursor down one visual line (word-wrap aware).
+    fn move_down_internal_wrapped(&mut self) {
+        let visual_lines = self.build_visual_lines();
+        let (current_vl_idx, current_col) =
+            self.byte_offset_to_visual_line(self.cursor_position, &visual_lines);
+        if current_vl_idx + 1 >= visual_lines.len() {
+            return;
+        }
+        let next_vl = &visual_lines[current_vl_idx + 1];
+        let vl_len = next_vl.end_byte_in_content - next_vl.start_byte_in_content;
+        let new_col = current_col.min(vl_len);
+        self.cursor_position = next_vl.start_byte_in_content + new_col;
+    }
+}
+
+/// Represents a single visual line after word wrapping.
+#[derive(Clone, Copy)]
+struct VisualLine {
+    content_line: usize,
+    start_byte_in_content: usize,
+    end_byte_in_content: usize,
+    is_first: bool,
 }
 
 /// GPUI Focusable trait implementation for keyboard event routing.
@@ -1683,6 +1995,10 @@ impl Focusable for TextEditor {
 /// - Text is rendered in monospace font for consistent character width
 impl Render for TextEditor {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        // Cache window width for word-wrap calculations
+        let window_bounds = window.bounds();
+        self.window_width = window_bounds.size.width.into();
+
         // Check if palette wants to open a file or close
         if let Some(palette_entity) = &self.palette {
             let palette = palette_entity.read(cx);
@@ -1725,7 +2041,10 @@ impl Render for TextEditor {
             .on_action(cx.listener(Self::handle_move_home))
             .on_action(cx.listener(Self::handle_move_end))
             .on_action(cx.listener(Self::handle_backspace))
+            .on_action(cx.listener(Self::handle_delete))
             .on_action(cx.listener(Self::handle_enter))
+            .on_action(cx.listener(Self::handle_tab))
+            .on_action(cx.listener(Self::handle_shift_tab))
             .on_action(cx.listener(Self::handle_save))
             .on_action(cx.listener(Self::handle_quit))
             .on_action(cx.listener(Self::handle_copy))
@@ -1739,11 +2058,59 @@ impl Render for TextEditor {
             .on_action(cx.listener(Self::handle_toggle_find))
             .on_action(cx.listener(Self::handle_find_next))
             .on_action(cx.listener(Self::handle_find_previous))
+            .on_action(cx.listener(Self::handle_toggle_goto_line))
             .on_action(cx.listener(Self::handle_toggle_palette))
             .on_action(cx.listener(Self::handle_undo))
             .on_action(cx.listener(Self::handle_redo))
+            .on_mouse_move(cx.listener(|editor, event: &gpui::MouseMoveEvent, _, cx| {
+                editor.handle_mouse_move(event, cx);
+            }))
+            .on_mouse_up(
+                gpui::MouseButton::Left,
+                cx.listener(|editor, event: &gpui::MouseUpEvent, _, _cx| {
+                    editor.handle_mouse_up(event, _cx);
+                }),
+            )
             .on_key_down(cx.listener(|editor, event: &KeyDownEvent, _, cx| {
                 if editor.handle_find_key_event(event, cx) {
+                    return;
+                }
+
+                // Handle go-to-line panel input
+                if let Some(ref mut input) = editor.goto_panel {
+                    match event.keystroke.key.as_str() {
+                        "escape" => {
+                            editor.goto_panel = None;
+                            cx.notify();
+                            return;
+                        }
+                        "enter" => {
+                            editor.goto_line_commit();
+                            cx.notify();
+                            return;
+                        }
+                        "backspace" => {
+                            input.pop();
+                            cx.notify();
+                            return;
+                        }
+                        _ => {}
+                    }
+                    if let Some(ref key_char) = event.keystroke.key_char {
+                        if key_char.len() == 1
+                            && !event.keystroke.modifiers.control
+                            && !event.keystroke.modifiers.alt
+                            && !event.keystroke.modifiers.platform
+                        {
+                            if let Some(c) = key_char.chars().next() {
+                                if c.is_ascii_digit() {
+                                    input.push(c);
+                                    cx.notify();
+                                    return;
+                                }
+                            }
+                        }
+                    }
                     return;
                 }
 
@@ -1803,58 +2170,82 @@ impl Render for TextEditor {
                     .flex_1()
                     .overflow_hidden()
                     .child(div().flex().flex_col().mt(px(-self.scroll_offset)).child({
-                        let lines: Vec<&str> = self.content.split('\n').collect();
-                        let mut current_pos = 0;
-                        let mut result = div().flex().flex_col();
                         let selection_range = self.get_selection_range();
-                        let total_lines = lines.len();
-                        let gutter_width =
-                            (total_lines.to_string().len() as f32 * self.char_width()) + 16.0;
+                        let visual_lines = self.build_visual_lines();
+                        let mut result = div().flex().flex_col();
+                        let gutter_width = self.gutter_width();
+                        let content_line_height = self.cursor_height();
 
-                        for (line_number, line) in lines.iter().enumerate() {
-                            let line_start = current_pos;
-                            let line_end = current_pos + line.len();
-                            let cursor_on_line = self.cursor_position >= line_start
-                                && self.cursor_position <= line_end;
-
-                            let tokens = MarkdownHighlighter::tokenize_line(line);
-
-                            let content_line_height = self.cursor_height();
-
-                            // Create a wrapper for the entire line (gutter + content)
+                        for vl in visual_lines.iter() {
                             let mut line_wrapper =
                                 div().flex().flex_row().min_h(px(content_line_height));
 
-                            // Add line number gutter
-                            line_wrapper = line_wrapper.child(
-                                div()
-                                    .w(px(gutter_width))
-                                    .flex()
-                                    .justify_end()
-                                    .pr_2()
-                                    .text_color(theme.editor.muted_text)
-                                    .child(format!("{}", line_number + 1)),
-                            );
+                            // Line number gutter (only on first visual line of content line)
+                            if vl.is_first {
+                                line_wrapper = line_wrapper.child(
+                                    div()
+                                        .w(px(gutter_width))
+                                        .flex()
+                                        .justify_end()
+                                        .pr_2()
+                                        .text_color(theme.editor.muted_text)
+                                        .child(format!("{}", vl.content_line + 1)),
+                                );
+                            } else {
+                                line_wrapper = line_wrapper.child(
+                                    div().w(px(gutter_width)),
+                                );
+                            }
 
-                            // Create the content div
                             let mut line_div =
                                 div().flex().flex_row().min_h(px(content_line_height));
-                            let mut char_count = 0;
 
+                            // Find parent line boundaries for tokenization
+                            let parent_line_start = self.content[..vl.start_byte_in_content]
+                                .rfind('\n')
+                                .map(|p| p + 1)
+                                .unwrap_or(0);
+                            let parent_line_end = self.content[vl.start_byte_in_content..]
+                                .find('\n')
+                                .map(|p| vl.start_byte_in_content + p)
+                                .unwrap_or(self.content.len());
+                            let parent_text = &self.content[parent_line_start..parent_line_end];
+                            let tokens = MarkdownHighlighter::tokenize_line(parent_text);
+
+                            let mut token_byte = parent_line_start;
                             for (text, token_type) in tokens {
-                                let token_color =
-                                    MarkdownHighlighter::get_color(&token_type, &theme.syntax);
-                                let token_start = line_start + char_count;
-                                let cursor_pos = if cursor_on_line {
-                                    Some(self.cursor_position)
-                                } else {
-                                    None
-                                };
+                                let token_start = token_byte;
+                                let token_end = token_byte + text.len();
+
+                                if token_end <= vl.start_byte_in_content
+                                    || token_start >= vl.end_byte_in_content
+                                {
+                                    token_byte += text.len();
+                                    continue;
+                                }
+
+                                let overlap_start = token_start.max(vl.start_byte_in_content);
+                                let overlap_end = token_end.min(vl.end_byte_in_content);
+                                let overlap_text =
+                                    &self.content[overlap_start..overlap_end];
+
+                                let token_color = MarkdownHighlighter::get_color(
+                                    &token_type,
+                                    &theme.syntax,
+                                );
+                                let cursor_pos =
+                                    if self.cursor_position >= overlap_start
+                                        && self.cursor_position <= overlap_end
+                                    {
+                                        Some(self.cursor_position)
+                                    } else {
+                                        None
+                                    };
 
                                 let segments = self.build_segments_for_token(
-                                    &text,
+                                    overlap_text,
                                     token_color,
-                                    token_start,
+                                    overlap_start,
                                     selection_range,
                                     cursor_pos,
                                     self.find_panel.as_ref(),
@@ -1875,7 +2266,8 @@ impl Render for TextEditor {
                                             if run.text.is_empty() {
                                                 continue;
                                             }
-                                            let mut node = div().text_color(run.text_color);
+                                            let mut node =
+                                                div().text_color(run.text_color);
                                             if let Some(bg) = run.background {
                                                 node = node.bg(bg);
                                             }
@@ -1884,24 +2276,23 @@ impl Render for TextEditor {
                                     }
                                 }
 
-                                char_count += text.len();
+                                token_byte += text.len();
                             }
 
-                            if cursor_on_line {
-                                let cursor_col = self.cursor_position - line_start;
-                                if cursor_col == line.len() {
-                                    line_div = line_div.child(
-                                        div()
-                                            .w(px(4.0))
-                                            .h(px(content_line_height))
-                                            .bg(theme.editor.cursor),
-                                    );
-                                }
+                            // Cursor at end of visual line
+                            if self.cursor_position == vl.end_byte_in_content
+                                && self.cursor_position <= self.content.len()
+                            {
+                                line_div = line_div.child(
+                                    div()
+                                        .w(px(4.0))
+                                        .h(px(content_line_height))
+                                        .bg(theme.editor.cursor),
+                                );
                             }
 
                             line_wrapper = line_wrapper.child(line_div);
                             result = result.child(line_wrapper);
-                            current_pos = line_end + 1;
                         }
 
                         result
@@ -2023,6 +2414,53 @@ impl Render for TextEditor {
                 );
 
             container = container.child(find_overlay);
+        }
+
+        // Add go-to-line overlay if active
+        if let Some(ref goto_input) = self.goto_panel {
+            let goto_overlay = div()
+                .absolute()
+                .top(px(self.padding()))
+                .left(px(self.padding() + self.gutter_width()))
+                .w(px(240.0))
+                .bg(theme.panel.background)
+                .border_1()
+                .border_color(theme.panel.border)
+                .rounded_md()
+                .shadow_lg()
+                .flex()
+                .flex_col()
+                .gap_2()
+                .p_3()
+                .child(
+                    div()
+                        .text_xs()
+                        .text_color(theme.panel.label_text)
+                        .child("Go to line"),
+                )
+                .child(
+                    div()
+                        .text_size(px(self.font_size()))
+                        .font_family(font_family)
+                        .text_color(if goto_input.is_empty() {
+                            theme.panel.placeholder_text
+                        } else {
+                            theme.panel.value_text
+                        })
+                        .child(if goto_input.is_empty() {
+                            "Type line number...".to_string()
+                        } else {
+                            goto_input.clone()
+                        }),
+                )
+                .child(
+                    div()
+                        .text_xs()
+                        .text_color(theme.panel.shortcut_text)
+                        .child("Enter: jump • Esc: close"),
+                );
+
+            container = container.child(goto_overlay);
         }
 
         // Add autocomplete overlay if active

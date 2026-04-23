@@ -24,7 +24,13 @@ medleytext demo.md
 - `Ctrl+Q` - Quit
 - `Ctrl+A` - Select all
 - `Ctrl+C/V/X` - Copy/Paste/Cut
+- `Ctrl+G` - Go to line
+- `Ctrl+F` - Find
+- `Delete` - Forward delete
+- `Tab` - Indent (2 spaces, or indent selected lines)
+- `Shift+Tab` - Unindent selected lines
 - Arrow keys - Navigate (Shift to select)
+- Mouse drag - Select text
 - Standard typing and editing
 
 **Fuzzy File Finder:**

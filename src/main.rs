@@ -38,10 +38,10 @@ fn main() {
 
     Application::new().run(move |cx: &mut App| {
         use editor::{
-            Backspace, Copy, Cut, Enter, FindNext, FindPrevious, MoveDown, MoveEnd, MoveHome,
-            MoveLeft, MoveRight, MoveUp, MoveWordLeft, MoveWordRight, Paste, Quit, Redo, Save,
-            SelectAll, SelectDown, SelectLeft, SelectRight, SelectUp, ToggleFind, TogglePalette,
-            Undo,
+            Backspace, Copy, Cut, Delete, Enter, FindNext, FindPrevious, MoveDown,
+            MoveEnd, MoveHome, MoveLeft, MoveRight, MoveUp, MoveWordLeft, MoveWordRight, Paste,
+            Quit, Redo, Save, SelectAll, SelectDown, SelectLeft, SelectRight, SelectUp, ShiftTab,
+            Tab, ToggleFind, ToggleGoToLine, TogglePalette, Undo,
         };
 
         // Configure global keybindings for the application.
@@ -57,6 +57,9 @@ fn main() {
             KeyBinding::new("home", MoveHome, None),
             KeyBinding::new("end", MoveEnd, None),
             KeyBinding::new("backspace", Backspace, None),
+            KeyBinding::new("delete", Delete, None),
+            KeyBinding::new("tab", Tab, None),
+            KeyBinding::new("shift-tab", ShiftTab, None),
             KeyBinding::new("enter", Enter, None),
             KeyBinding::new("ctrl-s", Save, None),
             KeyBinding::new("ctrl-q", Quit, None),
@@ -71,6 +74,7 @@ fn main() {
             KeyBinding::new("ctrl-p", TogglePalette, None),
             KeyBinding::new("ctrl-o", TogglePalette, None),
             KeyBinding::new("ctrl-f", ToggleFind, None),
+            KeyBinding::new("ctrl-g", ToggleGoToLine, None),
             KeyBinding::new("f3", FindNext, None),
             KeyBinding::new("shift-f3", FindPrevious, None),
             KeyBinding::new("ctrl-z", Undo, None),
