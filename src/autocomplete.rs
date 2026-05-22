@@ -1,7 +1,11 @@
-//! Autocomplete for markdown syntax suggestions.
+//! Autocomplete for Brief and Markdown syntax suggestions.
 //!
-//! Provides inline completion suggestions when typing markdown syntax,
-//! similar to nvim's completion menu.
+//! Provides inline completion suggestions when typing markup syntax. The
+//! suggestion list is language-aware: Brief offers single-marker emphasis
+//! (`*bold*`, `_italic_`, `+underline+`, `~strike~`) and shortcodes
+//! (`@link`, `@callout`, …); Markdown keeps its existing `**bold**` style.
+
+use crate::editor::Language;
 
 /// Represents a single autocomplete suggestion.
 #[derive(Debug, Clone)]
@@ -27,10 +31,14 @@ impl Autocomplete {
     ///
     /// * `trigger` - The character or pattern that triggered autocomplete
     /// * `line_content` - Content of the current line up to cursor
+    /// * `language` - Active markup language for the buffer
     ///
     /// Returns `None` if no suggestions are available for this context.
-    pub fn new(trigger: &str, line_content: &str) -> Option<Self> {
-        let suggestions = Self::get_suggestions(trigger, line_content)?;
+    pub fn new(trigger: &str, line_content: &str, language: Language) -> Option<Self> {
+        let suggestions = match language {
+            Language::Brief => Self::brief_suggestions(trigger, line_content)?,
+            Language::Markdown => Self::markdown_suggestions(trigger, line_content)?,
+        };
 
         if suggestions.is_empty() {
             None
@@ -42,11 +50,14 @@ impl Autocomplete {
         }
     }
 
-    /// Determines suggestions based on the trigger character and context.
-    fn get_suggestions(trigger: &str, line_content: &str) -> Option<Vec<Suggestion>> {
+    /// Brief-flavored suggestions. Differences from Markdown:
+    /// - Bold/italic use single-character markers.
+    /// - `@` opens shortcodes (`@link`, `@callout`, `@image`, `@kbd`, …).
+    /// - Code blocks default to a `brief` language tag.
+    fn brief_suggestions(trigger: &str, line_content: &str) -> Option<Vec<Suggestion>> {
         let trimmed = line_content.trim_start();
 
-        // Heading suggestions (trigger: # at start of line)
+        // Heading suggestions: `#` at start of line, levels 1–6.
         if trigger == "#" && trimmed.starts_with('#') && !trimmed.starts_with("######") {
             return Some(vec![
                 Suggestion {
@@ -76,7 +87,160 @@ impl Autocomplete {
             ]);
         }
 
-        // List suggestions (trigger: - at start of line)
+        // Bullet list / task markers: `- ` at start of line.
+        if trigger == "-" && trimmed == "-" {
+            return Some(vec![
+                Suggestion {
+                    insert_text: "- ".to_string(),
+                    label: "Bullet".to_string(),
+                },
+                Suggestion {
+                    insert_text: "- [ ] ".to_string(),
+                    label: "Task: todo".to_string(),
+                },
+                Suggestion {
+                    insert_text: "- [x] ".to_string(),
+                    label: "Task: done".to_string(),
+                },
+            ]);
+        }
+
+        // Code fence: `` ``` `` triggers fence variants.
+        if trigger == "`" && trimmed.starts_with("``") {
+            return Some(vec![
+                Suggestion {
+                    insert_text: "```\n\n```".to_string(),
+                    label: "Code block".to_string(),
+                },
+                Suggestion {
+                    insert_text: "```rust\n\n```".to_string(),
+                    label: "Rust".to_string(),
+                },
+                Suggestion {
+                    insert_text: "```javascript\n\n```".to_string(),
+                    label: "JavaScript".to_string(),
+                },
+                Suggestion {
+                    insert_text: "```python\n\n```".to_string(),
+                    label: "Python".to_string(),
+                },
+            ]);
+        }
+
+        // Inline code: a single ` mid-line.
+        if trigger == "`" && !trimmed.is_empty() && !trimmed.starts_with("``") {
+            let content_before_trigger = if line_content.len() > 1 {
+                &line_content[..line_content.len() - 1]
+            } else {
+                ""
+            };
+            let backtick_count = content_before_trigger.matches('`').count();
+            if backtick_count % 2 == 0 {
+                return Some(vec![Suggestion {
+                    insert_text: "`".to_string(),
+                    label: "Inline code".to_string(),
+                }]);
+            }
+            return None;
+        }
+
+        // Blockquote.
+        if trigger == ">" && trimmed == ">" {
+            return Some(vec![Suggestion {
+                insert_text: "> ".to_string(),
+                label: "Blockquote".to_string(),
+            }]);
+        }
+
+        // `[` opens a link/image/kbd/etc. body — Brief uses shortcodes for
+        // links, so this is a partial completion of `@link[text]` once the
+        // user has already typed `@link`. Bare `[` mid-text gets the
+        // markdown-style `@link[text](url)` snippet.
+        if trigger == "[" && !line_content.is_empty() {
+            return Some(vec![Suggestion {
+                insert_text: "[text](url)".to_string(),
+                label: "Link body + URL".to_string(),
+            }]);
+        }
+
+        // `@` opens a shortcode menu.
+        if trigger == "@" {
+            return Some(vec![
+                Suggestion {
+                    insert_text: "@link[text](url)".to_string(),
+                    label: "@link inline".to_string(),
+                },
+                Suggestion {
+                    insert_text: "@image(src: \"\", alt: \"\")[]".to_string(),
+                    label: "@image".to_string(),
+                },
+                Suggestion {
+                    insert_text: "@kbd[Ctrl+]".to_string(),
+                    label: "@kbd".to_string(),
+                },
+                Suggestion {
+                    insert_text: "@math[]".to_string(),
+                    label: "@math inline".to_string(),
+                },
+                Suggestion {
+                    insert_text: "@footnote[]".to_string(),
+                    label: "@footnote".to_string(),
+                },
+                Suggestion {
+                    insert_text: "@callout(kind: note)\n\n@end".to_string(),
+                    label: "@callout block".to_string(),
+                },
+                Suggestion {
+                    insert_text: "@details(summary: \"\")\n\n@end".to_string(),
+                    label: "@details block".to_string(),
+                },
+                Suggestion {
+                    insert_text: "@t\n| ".to_string(),
+                    label: "@t table".to_string(),
+                },
+                Suggestion {
+                    insert_text: "@dl\n\n@end".to_string(),
+                    label: "@dl definition list".to_string(),
+                },
+            ]);
+        }
+
+        None
+    }
+
+    /// Original Markdown suggestions, preserved for `.md` files.
+    fn markdown_suggestions(trigger: &str, line_content: &str) -> Option<Vec<Suggestion>> {
+        let trimmed = line_content.trim_start();
+
+        if trigger == "#" && trimmed.starts_with('#') && !trimmed.starts_with("######") {
+            return Some(vec![
+                Suggestion {
+                    insert_text: "# ".to_string(),
+                    label: "Heading 1".to_string(),
+                },
+                Suggestion {
+                    insert_text: "## ".to_string(),
+                    label: "Heading 2".to_string(),
+                },
+                Suggestion {
+                    insert_text: "### ".to_string(),
+                    label: "Heading 3".to_string(),
+                },
+                Suggestion {
+                    insert_text: "#### ".to_string(),
+                    label: "Heading 4".to_string(),
+                },
+                Suggestion {
+                    insert_text: "##### ".to_string(),
+                    label: "Heading 5".to_string(),
+                },
+                Suggestion {
+                    insert_text: "###### ".to_string(),
+                    label: "Heading 6".to_string(),
+                },
+            ]);
+        }
+
         if trigger == "-" && trimmed == "-" {
             return Some(vec![
                 Suggestion {
@@ -94,7 +258,6 @@ impl Autocomplete {
             ]);
         }
 
-        // Code block (trigger: ` repeated 3 times)
         if trigger == "`" && trimmed.starts_with("``") {
             return Some(vec![
                 Suggestion {
@@ -116,7 +279,6 @@ impl Autocomplete {
             ]);
         }
 
-        // Blockquote (trigger: > at start of line)
         if trigger == ">" && trimmed == ">" {
             return Some(vec![Suggestion {
                 insert_text: "> ".to_string(),
@@ -124,7 +286,6 @@ impl Autocomplete {
             }]);
         }
 
-        // Link (trigger: [ )
         if trigger == "[" && !line_content.is_empty() {
             return Some(vec![Suggestion {
                 insert_text: "[text](url)".to_string(),
@@ -132,43 +293,31 @@ impl Autocomplete {
             }]);
         }
 
-        // Inline code (trigger: ` in middle of line)
         if trigger == "`" && !trimmed.is_empty() && !trimmed.starts_with("``") {
-            // Check content BEFORE the just-typed backtick
             let content_before_trigger = if line_content.len() > 1 {
                 &line_content[..line_content.len() - 1]
             } else {
                 ""
             };
-
-            // Count backticks before the one we just typed
             let backtick_count = content_before_trigger.matches('`').count();
             if backtick_count % 2 == 0 {
-                // Even number means we're starting a new inline code
                 return Some(vec![Suggestion {
                     insert_text: "``".to_string(),
                     label: "Inline code".to_string(),
                 }]);
             }
-            // Odd number means we're closing, don't show autocomplete
             return None;
         }
 
-        // Bold/Italic (trigger: *)
         if trigger == "*" && !line_content.is_empty() {
-            // Need to check the content BEFORE the just-typed asterisk
-            // to determine if we're opening or closing
             let content_before_trigger = if line_content.len() > 1 {
                 &line_content[..line_content.len() - 1]
             } else {
                 ""
             };
-
-            // Count unpaired asterisks before the one we just typed
             let mut unpaired_single = 0;
             let mut unpaired_double = 0;
             let mut chars = content_before_trigger.chars().peekable();
-
             while let Some(ch) = chars.next() {
                 if ch == '*' {
                     if chars.peek() == Some(&'*') {
@@ -179,13 +328,9 @@ impl Autocomplete {
                     }
                 }
             }
-
-            // If we have unpaired formatting markers, we're likely closing
             if unpaired_single % 2 == 1 || unpaired_double % 2 == 1 {
                 return None;
             }
-
-            // Otherwise, show suggestions for starting new formatting
             return Some(vec![
                 Suggestion {
                     insert_text: "**".to_string(),

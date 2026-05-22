@@ -41,15 +41,27 @@ pub struct Palette {
 }
 
 impl Palette {
-    /// Creates a new Palette instance and scans for markdown files.
+    /// Creates a new Palette instance and scans for Brief / Markdown files.
     ///
     /// # Arguments
     ///
-    /// * `working_dir` - Directory to scan for .md files
+    /// * `working_dir` - Directory to scan
     /// * `theme` - Palette-specific color theme
     /// * `cx` - GPUI context for initialization
     pub fn new(working_dir: PathBuf, theme: PaletteTheme, cx: &mut Context<Self>) -> Self {
-        let all_files = Self::scan_markdown_files(&working_dir);
+        let mut all_files = Self::scan_text_files(&working_dir, &working_dir);
+        // Sort so `.brf` files appear before `.md` ones when no query is
+        // typed yet (Brief-first surfacing).
+        all_files.sort_by(|a, b| {
+            let rank = |name: &str| match Path::new(name).extension().and_then(|e| e.to_str()) {
+                Some("brf") => 0,
+                Some("md") | Some("markdown") | Some("mdown") | Some("mkd") => 1,
+                _ => 2,
+            };
+            rank(&a.display_name)
+                .cmp(&rank(&b.display_name))
+                .then_with(|| a.display_name.cmp(&b.display_name))
+        });
         let filtered_files = all_files.clone();
 
         Self {
@@ -64,18 +76,18 @@ impl Palette {
         }
     }
 
-    /// Scans the working directory recursively for .md files.
+    /// Scans the working directory recursively for `.brf` and `.md` files.
     ///
-    /// Returns a vector of FileEntry with paths and display names.
-    /// Excludes hidden directories and files (starting with '.').
-    fn scan_markdown_files(dir: &Path) -> Vec<FileEntry> {
+    /// Returns a vector of FileEntry with paths and display names relative
+    /// to `root` (so nested results display as `subdir/file.brf` rather
+    /// than just `file.brf`). Hidden directories and files are skipped.
+    fn scan_text_files(dir: &Path, root: &Path) -> Vec<FileEntry> {
         let mut files = Vec::new();
 
         if let Ok(entries) = std::fs::read_dir(dir) {
             for entry in entries.flatten() {
                 let path = entry.path();
 
-                // Skip hidden files/directories
                 if let Some(name) = path.file_name() {
                     if name.to_string_lossy().starts_with('.') {
                         continue;
@@ -83,22 +95,33 @@ impl Palette {
                 }
 
                 if path.is_dir() {
-                    // Recursively scan subdirectories
-                    files.extend(Self::scan_markdown_files(&path));
-                } else if path.extension().and_then(|s| s.to_str()) == Some("md") {
-                    if let Ok(abs_path) = path.canonicalize() {
-                        let display_name = path
-                            .strip_prefix(dir)
-                            .unwrap_or(&path)
-                            .to_string_lossy()
-                            .to_string();
+                    files.extend(Self::scan_text_files(&path, root));
+                    continue;
+                }
 
-                        files.push(FileEntry {
-                            path: abs_path,
-                            display_name,
-                            score: None,
-                        });
-                    }
+                let ext = path
+                    .extension()
+                    .and_then(|s| s.to_str())
+                    .map(|s| s.to_ascii_lowercase());
+                let is_brief_or_md = matches!(
+                    ext.as_deref(),
+                    Some("brf") | Some("md") | Some("markdown") | Some("mdown") | Some("mkd")
+                );
+                if !is_brief_or_md {
+                    continue;
+                }
+
+                if let Ok(abs_path) = path.canonicalize() {
+                    let display_name = path
+                        .strip_prefix(root)
+                        .unwrap_or(&path)
+                        .to_string_lossy()
+                        .to_string();
+                    files.push(FileEntry {
+                        path: abs_path,
+                        display_name,
+                        score: None,
+                    });
                 }
             }
         }

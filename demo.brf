@@ -1,0 +1,69 @@
+// MedleyText demo — Brief markup
+// Open this with `medleytext demo.brf` to see Brief-mode highlighting.
+
+# Heading 1
+
+## Heading 2
+
+### Heading 3
+
+This is a *bold* word, this is _italic_, this is +underline+, and this
+is ~strikethrough~. You can `inline code` too.
+
+A paragraph that spans
+two lines joins with a single space when rendered.
+
+The next paragraph has a hard break inside it.\
+This line breaks within the same paragraph.
+
+> A blockquote.
+>> Nested one level deeper.
+> Back to the outer.
+
+1. Ordered list item one
+2. Ordered list item two
+3. Ordered list item three
+
+- Bullet item
+  - Nested bullet (2-space indent)
+    - Deeper still
+- [x] ship v0.4
+- [ ] write release notes
+
+### Code blocks
+
+```python
+def greet(name):
+    return f"Hello, {name}!"
+print(greet("World"))
+```
+
+### Tables
+
+@t
+| Name    | Age | Role
+| Alice   | 30  | Developer
+| Bob     | 25  | Designer
+| Charlie | 35  | Product Lead
+
+### Shortcodes
+
+Press @kbd[Ctrl+S] to save. See @link[the Brief spec](https://docs.brief.kirillleventcov.com/)
+for the full grammar. Inline math: @math[E = m c^2].
+
+@callout(kind: note)
+Block shortcodes open with @name(args) and close with @end. The single
+extension point — no inline HTML in Brief.
+@end
+
+@details(summary: "Click to expand")
+Hidden content lives inside the body of a block shortcode.
+@end
+
+### Horizontal rule
+
+---
+
+### Escapes
+
+\*not bold\* and \[not a link\] — backslash escapes the next character.

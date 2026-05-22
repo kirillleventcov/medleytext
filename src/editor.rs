@@ -1,19 +1,45 @@
-//! Text editor component with markdown syntax highlighting.
+//! Text editor component with Brief- and Markdown-aware syntax highlighting.
 //!
 //! This module provides the core `TextEditor` struct and its associated
 //! functionality including cursor management, text selection, clipboard operations,
-//! scrolling, and rendering with real-time markdown syntax highlighting.
+//! scrolling, and rendering. The highlighter is chosen per file from the
+//! extension (`.md` → Markdown, everything else → Brief).
 
 use gpui::{
     App, ClipboardItem, Context, FocusHandle, Focusable, KeyDownEvent, MouseDownEvent, Render,
     Rgba, ScrollWheelEvent, Window, actions, div, prelude::*, px,
 };
 
+use std::path::Path;
+
 use crate::autocomplete::Autocomplete;
-use crate::config::{EditorConfig, Theme};
+use crate::brief::BriefHighlighter;
+use crate::config::{EditorConfig, SyntaxTheme, Theme};
 use crate::find::{ActiveInput, FindPanelState, SearchMatch};
 use crate::markdown::MarkdownHighlighter;
 use crate::palette::Palette;
+
+/// Markup language used to highlight, autocomplete, and continue lists.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Language {
+    Brief,
+    Markdown,
+}
+
+impl Language {
+    /// Returns the language for a file path, defaulting to Brief for any
+    /// extension that isn't `.md`/`.markdown` (including no extension).
+    pub fn from_path(path: &str) -> Self {
+        let ext = Path::new(path)
+            .extension()
+            .and_then(|e| e.to_str())
+            .map(|s| s.to_ascii_lowercase());
+        match ext.as_deref() {
+            Some("md") | Some("markdown") | Some("mdown") | Some("mkd") => Language::Markdown,
+            _ => Language::Brief,
+        }
+    }
+}
 
 // Define GPUI actions for keyboard shortcuts and user commands.
 // These actions are bound to keys in main.rs and handled by the TextEditor.
@@ -145,6 +171,10 @@ pub struct TextEditor {
 
     /// Cached window width for word-wrap calculations.
     window_width: f32,
+
+    /// Markup language driving highlighter, autocomplete, and smart-list
+    /// continuation. Re-derived from the file extension on open/load.
+    language: Language,
 }
 
 #[derive(Clone)]
@@ -244,12 +274,17 @@ impl TextEditor {
             }
         } else {
             (
-                String::from("Welcome to MedleyText!\n\nStart typing..."),
+                String::from("Welcome to MedleyText!\n\nBrief-first editor. Start typing..."),
                 None,
             )
         };
 
         let working_dir = std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from("."));
+
+        let language = current_file
+            .as_deref()
+            .map(Language::from_path)
+            .unwrap_or(Language::Brief);
 
         Self {
             content,
@@ -271,6 +306,23 @@ impl TextEditor {
             is_dragging: false,
             drag_start_position: 0,
             window_width: 800.0,
+            language,
+        }
+    }
+
+    /// Produces colored runs for one source line by dispatching to the
+    /// active language highlighter. Concatenation of run texts equals the
+    /// input line (callers rely on byte alignment).
+    fn line_runs(&self, line: &str, syntax: &SyntaxTheme) -> Vec<(String, Rgba)> {
+        match self.language {
+            Language::Brief => BriefHighlighter::tokenize_line(line)
+                .into_iter()
+                .map(|(text, kind)| (text, BriefHighlighter::get_color(&kind, syntax)))
+                .collect(),
+            Language::Markdown => MarkdownHighlighter::tokenize_line(line)
+                .into_iter()
+                .map(|(text, kind)| (text, MarkdownHighlighter::get_color(&kind, syntax)))
+                .collect(),
         }
     }
 
@@ -985,13 +1037,18 @@ impl TextEditor {
 
         self.push_edit(old_content, old_cursor, old_selection);
 
-        // Check if this character should trigger autocomplete
+        // Check if this character should trigger autocomplete. Brief has
+        // an extra trigger (`@` for shortcodes) and excludes `*` because
+        // Brief uses single `*` for bold (no `**bold**`).
         let trigger = c.to_string();
-        let triggers = ["#", "-", "`", ">", "[", "*"];
+        let triggers: &[&str] = match self.language {
+            Language::Brief => &["#", "-", "`", ">", "[", "@"],
+            Language::Markdown => &["#", "-", "`", ">", "[", "*"],
+        };
 
         if triggers.contains(&trigger.as_str()) {
             let line_content = self.get_current_line_content();
-            self.autocomplete = Autocomplete::new(&trigger, &line_content);
+            self.autocomplete = Autocomplete::new(&trigger, &line_content, self.language);
         } else if c == ' ' || c == '\n' {
             // Close autocomplete on space or newline
             self.autocomplete = None;
@@ -1104,6 +1161,9 @@ impl TextEditor {
         let line_start = self.find_line_start();
         let line_content = &self.content[line_start..self.cursor_position];
 
+        // `*` and `+` bullets are Markdown-only — Brief rejects them.
+        let allow_md_bullets = matches!(self.language, Language::Markdown);
+
         // Check for different list patterns
         let list_marker = if let Some(rest) = line_content.strip_prefix("- ") {
             if rest.trim().is_empty() {
@@ -1117,7 +1177,7 @@ impl TextEditor {
                 return;
             }
             Some(String::from("- "))
-        } else if let Some(rest) = line_content.strip_prefix("* ") {
+        } else if allow_md_bullets && let Some(rest) = line_content.strip_prefix("* ") {
             if rest.trim().is_empty() {
                 self.content.drain(line_start..self.cursor_position);
                 self.cursor_position = line_start;
@@ -1128,7 +1188,7 @@ impl TextEditor {
                 return;
             }
             Some(String::from("* "))
-        } else if let Some(rest) = line_content.strip_prefix("+ ") {
+        } else if allow_md_bullets && let Some(rest) = line_content.strip_prefix("+ ") {
             if rest.trim().is_empty() {
                 self.content.drain(line_start..self.cursor_position);
                 self.cursor_position = line_start;
@@ -1223,8 +1283,14 @@ impl TextEditor {
 
         if let Some((sel_start, sel_end)) = self.get_selection_range() {
             // Multi-line indent: find line starts in selection and indent each
-            let start_line = self.content[..sel_start].rfind('\n').map(|p| p + 1).unwrap_or(0);
-            let _end_line = self.content[..sel_end].rfind('\n').map(|p| p + 1).unwrap_or(0);
+            let start_line = self.content[..sel_start]
+                .rfind('\n')
+                .map(|p| p + 1)
+                .unwrap_or(0);
+            let _end_line = self.content[..sel_end]
+                .rfind('\n')
+                .map(|p| p + 1)
+                .unwrap_or(0);
 
             let mut insertions = Vec::new();
             let mut pos = start_line;
@@ -1249,7 +1315,12 @@ impl TextEditor {
 
             self.cursor_position = old_cursor + if old_cursor >= start_line { 2 } else { 0 };
             if let Some(ref mut sel) = self.selection_start {
-                *sel = old_selection.unwrap() + if old_selection.unwrap() >= start_line { 2 } else { 0 };
+                *sel = old_selection.unwrap()
+                    + if old_selection.unwrap() >= start_line {
+                        2
+                    } else {
+                        0
+                    };
             }
             // Adjust selection end
             let sel_end_new = sel_end + shift;
@@ -1284,12 +1355,18 @@ impl TextEditor {
         let old_selection = self.selection_start;
 
         if let Some((sel_start, sel_end)) = self.get_selection_range() {
-            let start_line = self.content[..sel_start].rfind('\n').map(|p| p + 1).unwrap_or(0);
+            let start_line = self.content[..sel_start]
+                .rfind('\n')
+                .map(|p| p + 1)
+                .unwrap_or(0);
 
             let mut removals = Vec::new();
             let mut pos = start_line;
             while pos <= sel_end && pos < self.content.len() {
-                let line_end = self.content[pos..].find('\n').map(|p| pos + p).unwrap_or(self.content.len());
+                let line_end = self.content[pos..]
+                    .find('\n')
+                    .map(|p| pos + p)
+                    .unwrap_or(self.content.len());
                 let line_text = &self.content[pos..line_end];
                 let spaces = line_text.chars().take_while(|c| *c == ' ').count();
                 let remove = spaces.min(2);
@@ -1301,11 +1378,13 @@ impl TextEditor {
 
             let mut shift = 0;
             for &(remove_pos, remove_count) in removals.iter().rev() {
-                self.content.drain(remove_pos + shift..remove_pos + shift + remove_count);
+                self.content
+                    .drain(remove_pos + shift..remove_pos + shift + remove_count);
                 shift -= remove_count;
             }
 
-            self.cursor_position = old_cursor.saturating_sub(if old_cursor > start_line { 2 } else { 0 });
+            self.cursor_position =
+                old_cursor.saturating_sub(if old_cursor > start_line { 2 } else { 0 });
             if let Some(ref mut sel) = self.selection_start {
                 let old = old_selection.unwrap();
                 *sel = old.saturating_sub(if old > start_line { 2 } else { 0 });
@@ -1327,7 +1406,8 @@ impl TextEditor {
             .min(2);
         if spaces_before > 0 {
             self.cursor_position -= spaces_before;
-            self.content.drain(self.cursor_position..self.cursor_position + spaces_before);
+            self.content
+                .drain(self.cursor_position..self.cursor_position + spaces_before);
             self.is_dirty = true;
             self.push_edit(old_content, old_cursor, old_selection);
             self.refresh_search_matches();
@@ -1720,8 +1800,12 @@ impl TextEditor {
                 self.cursor_position = 0;
                 self.selection_start = None;
                 self.scroll_offset = 0.0;
-                self.current_file = Some(path.to_string_lossy().to_string());
+                let path_str = path.to_string_lossy().to_string();
+                self.language = Language::from_path(&path_str);
+                self.current_file = Some(path_str);
                 self.is_dirty = false;
+                self.undo_stack.clear();
+                self.redo_stack.clear();
                 println!("Loaded file: {}", path.display());
                 cx.notify();
             }
@@ -2192,9 +2276,7 @@ impl Render for TextEditor {
                                         .child(format!("{}", vl.content_line + 1)),
                                 );
                             } else {
-                                line_wrapper = line_wrapper.child(
-                                    div().w(px(gutter_width)),
-                                );
+                                line_wrapper = line_wrapper.child(div().w(px(gutter_width)));
                             }
 
                             let mut line_div =
@@ -2210,10 +2292,10 @@ impl Render for TextEditor {
                                 .map(|p| vl.start_byte_in_content + p)
                                 .unwrap_or(self.content.len());
                             let parent_text = &self.content[parent_line_start..parent_line_end];
-                            let tokens = MarkdownHighlighter::tokenize_line(parent_text);
+                            let runs = self.line_runs(parent_text, &theme.syntax);
 
                             let mut token_byte = parent_line_start;
-                            for (text, token_type) in tokens {
+                            for (text, token_color) in runs {
                                 let token_start = token_byte;
                                 let token_end = token_byte + text.len();
 
@@ -2226,21 +2308,14 @@ impl Render for TextEditor {
 
                                 let overlap_start = token_start.max(vl.start_byte_in_content);
                                 let overlap_end = token_end.min(vl.end_byte_in_content);
-                                let overlap_text =
-                                    &self.content[overlap_start..overlap_end];
-
-                                let token_color = MarkdownHighlighter::get_color(
-                                    &token_type,
-                                    &theme.syntax,
-                                );
-                                let cursor_pos =
-                                    if self.cursor_position >= overlap_start
-                                        && self.cursor_position <= overlap_end
-                                    {
-                                        Some(self.cursor_position)
-                                    } else {
-                                        None
-                                    };
+                                let overlap_text = &self.content[overlap_start..overlap_end];
+                                let cursor_pos = if self.cursor_position >= overlap_start
+                                    && self.cursor_position <= overlap_end
+                                {
+                                    Some(self.cursor_position)
+                                } else {
+                                    None
+                                };
 
                                 let segments = self.build_segments_for_token(
                                     overlap_text,
@@ -2266,8 +2341,7 @@ impl Render for TextEditor {
                                             if run.text.is_empty() {
                                                 continue;
                                             }
-                                            let mut node =
-                                                div().text_color(run.text_color);
+                                            let mut node = div().text_color(run.text_color);
                                             if let Some(bg) = run.background {
                                                 node = node.bg(bg);
                                             }

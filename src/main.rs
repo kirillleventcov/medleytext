@@ -1,9 +1,10 @@
-//! MedleyText - A markdown-first text editor built with GPUI.
+//! MedleyText — a Brief-first text editor built with GPUI.
 //!
-//! This is the main entry point for the application. It handles initialization,
-//! key binding configuration, and window creation.
+//! Brief (`.brf`) is the default markup language. Markdown (`.md`) is still
+//! supported with its own highlighter so existing notes keep working.
 
 mod autocomplete;
+mod brief;
 mod config;
 mod editor;
 mod find;
@@ -38,10 +39,10 @@ fn main() {
 
     Application::new().run(move |cx: &mut App| {
         use editor::{
-            Backspace, Copy, Cut, Delete, Enter, FindNext, FindPrevious, MoveDown,
-            MoveEnd, MoveHome, MoveLeft, MoveRight, MoveUp, MoveWordLeft, MoveWordRight, Paste,
-            Quit, Redo, Save, SelectAll, SelectDown, SelectLeft, SelectRight, SelectUp, ShiftTab,
-            Tab, ToggleFind, ToggleGoToLine, TogglePalette, Undo,
+            Backspace, Copy, Cut, Delete, Enter, FindNext, FindPrevious, MoveDown, MoveEnd,
+            MoveHome, MoveLeft, MoveRight, MoveUp, MoveWordLeft, MoveWordRight, Paste, Quit, Redo,
+            Save, SelectAll, SelectDown, SelectLeft, SelectRight, SelectUp, ShiftTab, Tab,
+            ToggleFind, ToggleGoToLine, TogglePalette, Undo,
         };
 
         // Configure global keybindings for the application.

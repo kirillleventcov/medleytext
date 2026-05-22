@@ -1,64 +1,76 @@
 # MedleyText
 
-A lightweight markdown-first text editor built from scratch with [GPUI](https://crates.io/crates/gpui).
+A lightweight **Brief-first** text editor built from scratch with [GPUI](https://crates.io/crates/gpui). Native syntax highlighting for [Brief](https://github.com/kirillleventcov/brief) (`.brf`) and Markdown (`.md`) in the same buffer. Brief docs: [docs.brief.kirillleventcov.com](https://docs.brief.kirillleventcov.com/).
+
+## Why Brief-first
+
+Brief is a strict markup language where every construct has one canonical spelling — `*bold*` (not `**bold**`), `-` bullets only (not `*` or `+`), two-space indentation, single-marker emphasis, and a single extension point via `@shortcodes`. It is designed to be human-readable and token-economic for LLMs.
+
+MedleyText treats Brief as the default language for any unknown or `.brf`-extension buffer; Markdown stays supported for `.md` / `.markdown` files so existing notes keep working without conversion.
 
 ## Features
 
-- **Fuzzy File Finder** - Quick-open palette (Ctrl+P) for instant navigation across markdown files
-- Markdown syntax highlighting (headings, bold, italic, code, links, lists, checkboxes, blockquotes)
-- Color-coded checkbox states (complete/incomplete)
-- Minimal interface focused on writing
-- Keyboard-driven workflow
-- Zero external dependencies (except GPUI)
+- **Brief syntax highlighting** — headings, single-marker emphasis (`*bold*`, `_italic_`, `+underline+`, `~strike~`), inline code, shortcodes (`@link`, `@callout`, `@image`, …), block directives (`@t`, `@dl`, `@end`), task markers, line / block comments, horizontal rules, tables.
+- **Markdown syntax highlighting** retained for `.md` files (CommonMark-style `**bold**`, `*italic*`, link / list / checkbox / blockquote / code-block, etc.).
+- **Fuzzy file finder** (Ctrl+P / Ctrl+O) — surfaces `.brf` files first, then `.md`, scored across the working directory.
+- **Smart list continuation** that respects each language's rules (Brief: `-` only; Markdown: `-` / `*` / `+`).
+- **Shortcode autocomplete** triggered by `@` inside `.brf` buffers (`@link`, `@kbd`, `@math`, `@callout`, `@details`, `@t`, `@dl`, …).
+- Keyboard-driven workflow, GPU-accelerated rendering, configurable themes (Default + the four Catppuccin flavors), undo / redo, drag-select, word wrap, find / replace, go-to-line.
 
 ## Usage
 
 ```bash
-medleytext demo.md
+medleytext              # opens an empty Brief buffer
+medleytext notes.brf    # Brief
+medleytext notes.md     # Markdown (highlighter switches automatically)
 ```
 
-**Keybindings:**
+**Keybindings**
 
-- `Ctrl+O` / `Ctrl+P` - Open fuzzy file finder
-- `Ctrl+S` - Save
-- `Ctrl+Q` - Quit
-- `Ctrl+A` - Select all
-- `Ctrl+C/V/X` - Copy/Paste/Cut
-- `Ctrl+G` - Go to line
-- `Ctrl+F` - Find
-- `Delete` - Forward delete
-- `Tab` - Indent (2 spaces, or indent selected lines)
-- `Shift+Tab` - Unindent selected lines
-- Arrow keys - Navigate (Shift to select)
-- Mouse drag - Select text
-- Standard typing and editing
+- `Ctrl+O` / `Ctrl+P` — open fuzzy file finder
+- `Ctrl+S` — save
+- `Ctrl+Q` — quit
+- `Ctrl+A` — select all
+- `Ctrl+C` / `Ctrl+V` / `Ctrl+X` — copy / paste / cut
+- `Ctrl+Z` / `Ctrl+Shift+Z` (or `Ctrl+Y`) — undo / redo
+- `Ctrl+F` — find / replace
+- `Ctrl+G` — go to line
+- `F3` / `Shift+F3` — next / previous match
+- `Delete` — forward delete
+- `Tab` — indent (2 spaces, or indent selected lines — Brief requires 2-space indent)
+- `Shift+Tab` — unindent selected lines
+- Arrow keys — navigate (Shift to select)
+- Mouse drag — select text
 
-**Fuzzy File Finder:**
+**Fuzzy file finder**
 
-- Type to search files with fuzzy matching
-- `↑/↓` - Navigate results
-- `Enter` - Open selected file
-- `Esc` - Close palette
+- Type to filter `.brf` and `.md` files with fuzzy matching
+- `↑` / `↓` — navigate results
+- `Enter` — open
+- `Esc` — close
 
 ## Building
 
-### MacOS Notes
-
-Follow [Zed's Guide on MacOS building](https://github.com/zed-industries/zed/blob/main/docs/src/development/macos.md) to install the necessary dependencies.
-
 ```bash
+git clone https://github.com/kirillleventcov/medleytext.git
+cd medleytext
 cargo build --release
+./target/release/medleytext demo.brf
 ```
+
+The Brief compiler is pulled from crates.io as [`brief-core`](https://crates.io/crates/brief-core).
+
+### macOS notes
+
+Follow [Zed's macOS build guide](https://github.com/zed-industries/zed/blob/main/docs/src/development/macos.md) for system dependencies.
 
 ## Configuration
 
-MedleyText reads optional settings from `~/.config/medleytext/config`. Each non-empty line uses either `key=value` or `key: value`. Lines beginning with `#` or `//` are ignored.
-
-The file is created automatically with sensible defaults the first time you launch MedleyText, so you can open it and tweak values right away.
+MedleyText reads optional settings from `~/.config/medleytext/config`. Each non-empty line uses either `key=value` or `key: value`. Lines beginning with `#` or `//` are ignored. The file is created automatically with sensible defaults on first launch.
 
 ### Core options
 
-- `font-size` &mdash; UI font size (clamped between 8 and 72, default `14`)
+- `font-size` — UI font size (clamped between 8 and 72, default `14`)
 
 ### Theme presets
 
@@ -72,60 +84,16 @@ Available presets: `default`, `catppuccin-mocha`, `catppuccin-macchiato`, `catpp
 
 ### Color overrides
 
-Color values accept `#RRGGBB` or `0xRRGGBB`. Any unspecified key falls back to the current preset/default.
+Color values accept `#RRGGBB` or `0xRRGGBB`. Any unspecified key falls back to the current preset / default.
 
-- **Editor surface**
-  - `theme.editor.background`
-  - `theme.editor.border`
-  - `theme.editor.text`
-  - `theme.editor.muted-text`
-  - `theme.editor.cursor`
-- **Highlights**
-  - `theme.highlight.selection.background`
-  - `theme.highlight.selection.foreground`
-  - `theme.highlight.search-active.background`
-  - `theme.highlight.search-active.foreground`
-  - `theme.highlight.search-match.background`
-  - `theme.highlight.search-match.foreground`
-- **Panels (find dialog)**
-  - `theme.panel.background`
-  - `theme.panel.border`
-  - `theme.panel.active-row.background`
-  - `theme.panel.inactive-row.background`
-  - `theme.panel.label-text`
-  - `theme.panel.value-text`
-  - `theme.panel.placeholder-text`
-  - `theme.panel.status-text`
-  - `theme.panel.shortcut-text`
-- **Command palette**
-  - `theme.palette.background`
-  - `theme.palette.border`
-  - `theme.palette.input-text`
-  - `theme.palette.item.background`
-  - `theme.palette.item.foreground`
-  - `theme.palette.item-selected.background`
-  - `theme.palette.item-selected.foreground`
-  - `theme.palette.footer-text`
-- **Autocomplete menu**
-  - `theme.autocomplete.background`
-  - `theme.autocomplete.border`
-  - `theme.autocomplete.item.background`
-  - `theme.autocomplete.item.foreground`
-  - `theme.autocomplete.item-selected.background`
-  - `theme.autocomplete.item-selected.foreground`
-  - `theme.autocomplete.label-text`
-- **Markdown syntax**
-  - `theme.syntax.heading1` &hellip; `theme.syntax.heading6`
-  - `theme.syntax.bold`
-  - `theme.syntax.italic`
-  - `theme.syntax.code`
-  - `theme.syntax.code-block`
-  - `theme.syntax.link`
-  - `theme.syntax.list`
-  - `theme.syntax.checkbox-checked`
-  - `theme.syntax.checkbox-unchecked`
-  - `theme.syntax.blockquote`
-  - `theme.syntax.normal`
+- **Editor surface** — `theme.editor.{background,border,text,muted-text,cursor}`
+- **Highlights** — `theme.highlight.selection.{background,foreground}`, `theme.highlight.search-active.{background,foreground}`, `theme.highlight.search-match.{background,foreground}`
+- **Panels (find dialog)** — `theme.panel.{background,border,active-row.background,inactive-row.background,label-text,value-text,placeholder-text,status-text,shortcut-text}`
+- **Command palette** — `theme.palette.{background,border,input-text,item.background,item.foreground,item-selected.background,item-selected.foreground,footer-text}`
+- **Autocomplete menu** — `theme.autocomplete.{background,border,item.background,item.foreground,item-selected.background,item-selected.foreground,label-text}`
+- **Syntax** — `theme.syntax.{heading1…heading6,bold,italic,underline,strikethrough,code,code-block,link,list,checkbox-checked,checkbox-unchecked,blockquote,comment,shortcode,table,hr,hard-break,escape,normal}`
+
+The `underline`, `strikethrough`, `comment`, `shortcode`, `table`, `hr`, `hard-break`, and `escape` keys are exposed for Brief; they're inert in Markdown documents (no token of that kind is produced) but you can still set them safely.
 
 ### Example: Catppuccin Mocha + tweaks
 
@@ -133,15 +101,53 @@ Color values accept `#RRGGBB` or `0xRRGGBB`. Any unspecified key falls back to t
 font-size = 16
 theme.preset = catppuccin-mocha
 
-# Personal accents
+// Personal accents
 theme.highlight.selection.background = #F5C2E7
 theme.highlight.selection.foreground = #1E1E2E
-theme.palette.item-selected.background = #B4BEFE
-theme.palette.item-selected.foreground = #1E1E2E
+theme.syntax.shortcode = #cba6f7
+theme.syntax.comment   = #6c7086
 ```
 
-Restart MedleyText (or close/open the window) after editing the config file to load new values.
+Restart MedleyText (or close / open the window) after editing the config file to load new values.
+
+## Brief cheatsheet
+
+```brief
+// line comment
+
+# Heading 1 .. ###### Heading 6 (exactly one space, max 6)
+
+A paragraph with *bold*, _italic_, +underline+, ~strike~ words.\
+A trailing backslash forces a hard break inside the paragraph.
+
+- bullet (only `-` is valid)
+- [x] done task
+- [ ] todo task
+1. ordered list (must start at 1, sequential)
+2. ordered list
+
+> blockquote
+>> nested
+
+```rust
+fn main() { println!("hi"); }
+```
+
+---  (horizontal rule)
+
+@t
+| Name | Age | City
+| Ada  | 36  | London
+
+@callout(kind: note)
+Block shortcodes open with @name(args) and close with @end.
+@end
+
+See @link[the spec](https://docs.brief.kirillleventcov.com/) and press @kbd[Ctrl+S].
+```
+
+The complete grammar lives in `LearnXinYminutes.brf` in the upstream Brief repo.
 
 ## Documentation
 
-Built with [GPUI](https://docs.rs/gpui/latest/gpui/), a GPU-accelerated UI framework for Rust.
+Built with [GPUI](https://docs.rs/gpui/latest/gpui/), a GPU-accelerated UI framework for Rust. Brief compiler lives at [github.com/kirillleventcov/brief](https://github.com/kirillleventcov/brief) — see [`LearnXinYminutes.brf`](https://github.com/kirillleventcov/brief/blob/main/LearnXinYminutes.brf) for the full grammar in one file.

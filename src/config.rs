@@ -17,6 +17,8 @@ impl EditorConfig {
 // Examples:
 //   theme.preset = catppuccin-mocha
 //   theme.editor.background = #2d2d2d
+//
+// MedleyText is a Brief-first editor (.brf files). Markdown (.md) still works.
 
 font-size = 14
 theme.preset = default
@@ -502,6 +504,8 @@ pub struct SyntaxTheme {
     heading: [Rgba; 6],
     pub bold: Rgba,
     pub italic: Rgba,
+    pub underline: Rgba,
+    pub strikethrough: Rgba,
     pub code: Rgba,
     pub link: Rgba,
     pub list: Rgba,
@@ -509,6 +513,12 @@ pub struct SyntaxTheme {
     pub checkbox_unchecked: Rgba,
     pub blockquote: Rgba,
     pub code_block: Rgba,
+    pub comment: Rgba,
+    pub shortcode: Rgba,
+    pub table: Rgba,
+    pub hr: Rgba,
+    pub hard_break: Rgba,
+    pub escape: Rgba,
     pub normal: Rgba,
 }
 
@@ -529,6 +539,8 @@ impl SyntaxTheme {
             "heading6" => self.heading[5] = color,
             "bold" => self.bold = color,
             "italic" => self.italic = color,
+            "underline" => self.underline = color,
+            "strikethrough" | "strike" => self.strikethrough = color,
             "code" => self.code = color,
             "link" => self.link = color,
             "list" => self.list = color,
@@ -536,6 +548,12 @@ impl SyntaxTheme {
             "checkbox-unchecked" | "checkbox_unchecked" => self.checkbox_unchecked = color,
             "blockquote" => self.blockquote = color,
             "code-block" | "code_block" => self.code_block = color,
+            "comment" => self.comment = color,
+            "shortcode" => self.shortcode = color,
+            "table" => self.table = color,
+            "hr" | "horizontal-rule" | "horizontal_rule" => self.hr = color,
+            "hard-break" | "hard_break" | "break" => self.hard_break = color,
+            "escape" => self.escape = color,
             "normal" => self.normal = color,
             _ => {}
         }
@@ -553,6 +571,8 @@ impl SyntaxTheme {
             ],
             bold: rgb(0xf5a97f),
             italic: rgb(0xf2cdcd),
+            underline: rgb(0x89b4fa),
+            strikethrough: rgb(0x6c7086),
             code: rgb(0xfab387),
             link: rgb(0x89b4fa),
             list: rgb(0xb4befe),
@@ -560,6 +580,12 @@ impl SyntaxTheme {
             checkbox_unchecked: rgb(0xf38ba8),
             blockquote: rgb(0x94e2d5),
             code_block: rgb(0xfab387),
+            comment: rgb(0x6c7086),
+            shortcode: rgb(0xcba6f7),
+            table: rgb(0x9399b2),
+            hr: rgb(0x6c7086),
+            hard_break: rgb(0x6c7086),
+            escape: rgb(0x6c7086),
             normal: rgb(0xcdd6f4),
         }
     }
@@ -576,6 +602,8 @@ impl SyntaxTheme {
             ],
             bold: rgb(0xdf8e1d),
             italic: rgb(0xdd7878),
+            underline: rgb(0x1e66f5),
+            strikethrough: rgb(0x9ca0b0),
             code: rgb(0xfe640b),
             link: rgb(0x1e66f5),
             list: rgb(0x8839ef),
@@ -583,6 +611,12 @@ impl SyntaxTheme {
             checkbox_unchecked: rgb(0xd20f39),
             blockquote: rgb(0x209fb5),
             code_block: rgb(0xfe640b),
+            comment: rgb(0x9ca0b0),
+            shortcode: rgb(0x8839ef),
+            table: rgb(0x7c7f93),
+            hr: rgb(0x9ca0b0),
+            hard_break: rgb(0x9ca0b0),
+            escape: rgb(0x9ca0b0),
             normal: rgb(0x4c4f69),
         }
     }
@@ -599,6 +633,8 @@ impl SyntaxTheme {
             ],
             bold: rgb(0xef9f76),
             italic: rgb(0xeebebe),
+            underline: rgb(0x8caaee),
+            strikethrough: rgb(0x737994),
             code: rgb(0xfab387),
             link: rgb(0x8caaee),
             list: rgb(0xbabbf1),
@@ -606,6 +642,12 @@ impl SyntaxTheme {
             checkbox_unchecked: rgb(0xe78284),
             blockquote: rgb(0x81c8be),
             code_block: rgb(0xfab387),
+            comment: rgb(0x737994),
+            shortcode: rgb(0xca9ee6),
+            table: rgb(0x949cbb),
+            hr: rgb(0x737994),
+            hard_break: rgb(0x737994),
+            escape: rgb(0x737994),
             normal: rgb(0xc6d0f5),
         }
     }
@@ -622,6 +664,8 @@ impl SyntaxTheme {
             ],
             bold: rgb(0xf4a8d1),
             italic: rgb(0xf0c6c6),
+            underline: rgb(0x8aadf4),
+            strikethrough: rgb(0x6e738d),
             code: rgb(0xf5a97f),
             link: rgb(0x8aadf4),
             list: rgb(0xb7bdf8),
@@ -629,6 +673,12 @@ impl SyntaxTheme {
             checkbox_unchecked: rgb(0xf0c6c6),
             blockquote: rgb(0x91d7e3),
             code_block: rgb(0xf5a97f),
+            comment: rgb(0x6e738d),
+            shortcode: rgb(0xc6a0f6),
+            table: rgb(0x939ab7),
+            hr: rgb(0x6e738d),
+            hard_break: rgb(0x6e738d),
+            escape: rgb(0x6e738d),
             normal: rgb(0xcad3f5),
         }
     }
@@ -647,6 +697,8 @@ impl Default for SyntaxTheme {
             ],
             bold: rgb(0xDCDCAA),
             italic: rgb(0xCE9178),
+            underline: rgb(0x9CDCFE),
+            strikethrough: rgb(0x808080),
             code: rgb(0xD16969),
             link: rgb(0x9CDCFE),
             list: rgb(0xC586C0),
@@ -654,6 +706,12 @@ impl Default for SyntaxTheme {
             checkbox_unchecked: rgb(0xF48771),
             blockquote: rgb(0x6A9955),
             code_block: rgb(0xD16969),
+            comment: rgb(0x6A9955),
+            shortcode: rgb(0xC586C0),
+            table: rgb(0x808080),
+            hr: rgb(0x808080),
+            hard_break: rgb(0x808080),
+            escape: rgb(0x808080),
             normal: rgb(0xD4D4D4),
         }
     }
