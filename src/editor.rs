@@ -6,11 +6,13 @@
 //! extension (`.md` → Markdown, everything else → Brief).
 
 use gpui::{
-    App, ClipboardItem, Context, FocusHandle, Focusable, KeyDownEvent, MouseDownEvent, Render,
-    Rgba, ScrollWheelEvent, Window, actions, div, prelude::*, px,
+    App, Bounds, ClipboardItem, Context, FocusHandle, Focusable, KeyDownEvent, MouseDownEvent,
+    PathPromptOptions, Pixels, Point, Render, Rgba, ScrollWheelEvent, Timer, Window, WindowBounds,
+    WindowOptions, actions, canvas, div, prelude::*, px, size,
 };
 
-use std::path::Path;
+use std::path::{Path, PathBuf};
+use std::time::Duration;
 
 use crate::autocomplete::Autocomplete;
 use crate::brief::BriefHighlighter;
@@ -74,6 +76,7 @@ actions!(
         FindPrevious,
         ToggleGoToLine,
         TogglePalette,
+        OpenFolder,
         Undo,
         Redo,
     ]
@@ -136,8 +139,10 @@ pub struct TextEditor {
     /// Command palette for fuzzy file finding. `None` when closed.
     palette: Option<gpui::Entity<Palette>>,
 
-    /// Working directory for file operations and palette scanning.
-    working_dir: std::path::PathBuf,
+    /// Working directory for palette fuzzy-find. `None` in draft mode — the
+    /// editor avoids scanning the filesystem until a folder is explicitly
+    /// opened.
+    working_dir: Option<PathBuf>,
 
     /// Tracks if buffer has unsaved changes.
     is_dirty: bool,
@@ -175,6 +180,15 @@ pub struct TextEditor {
     /// Markup language driving highlighter, autocomplete, and smart-list
     /// continuation. Re-derived from the file extension on open/load.
     language: Language,
+
+    /// Whether the caret is visible during the blink cycle.
+    cursor_blink_visible: bool,
+
+    /// Last cursor position used to restart blinking after movement.
+    cursor_blink_reset_position: usize,
+
+    /// Window bounds of the scroll viewport, updated each frame during paint.
+    scroll_viewport_bounds: Option<Bounds<Pixels>>,
 }
 
 #[derive(Clone)]
@@ -230,25 +244,28 @@ impl HighlightKind {
 }
 
 impl TextEditor {
-    /// Creates a new TextEditor instance, optionally loading content from a file.
+    /// Creates a new TextEditor instance.
     ///
     /// # Arguments
     ///
-    /// * `file_path` - Optional path to file to load. If `None`, starts with welcome message.
+    /// * `file_path` - Optional path to a file to load. When `None`, the editor
+    ///   starts as an empty draft buffer (Notepad++-style).
+    /// * `working_dir` - Optional folder to scope palette fuzzy-find. When
+    ///   `None`, the editor will not scan the filesystem; Ctrl+P/Ctrl+O fall
+    ///   back to a native file picker instead.
+    /// * `config` - Loaded editor configuration.
     /// * `cx` - GPUI context for initialization.
     ///
     /// # Behavior
     ///
-    /// - If file exists: loads content and stores path
-    /// - If file doesn't exist: creates empty file on disk and stores path
-    /// - If no path provided: shows welcome message with no associated file
-    ///
-    /// # Error Handling
-    ///
-    /// File read errors are logged to stderr but don't prevent editor initialization.
-    /// This allows creating new files or recovering from read permission issues.
+    /// - If `file_path` exists: loads content and stores path.
+    /// - If `file_path` is provided but missing: starts with an empty buffer
+    ///   and remembers the target path; nothing is written to disk until the
+    ///   user saves.
+    /// - If no `file_path`: starts as an empty unsaved draft.
     pub fn with_file(
         file_path: Option<String>,
+        working_dir: Option<PathBuf>,
         config: EditorConfig,
         cx: &mut Context<Self>,
     ) -> Self {
@@ -258,35 +275,22 @@ impl TextEditor {
                     println!("Loaded file: {}", path);
                     (content, Some(path))
                 }
-                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-                    if let Err(create_err) = std::fs::write(&path, "") {
-                        eprintln!("Failed to create file: {}", create_err);
-                        (String::new(), Some(path))
-                    } else {
-                        println!("Created new file: {}", path);
-                        (String::new(), Some(path))
-                    }
-                }
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => (String::new(), Some(path)),
                 Err(e) => {
                     eprintln!("Failed to open file: {}", e);
                     (String::new(), Some(path))
                 }
             }
         } else {
-            (
-                String::from("Welcome to MedleyText!\n\nBrief-first editor. Start typing..."),
-                None,
-            )
+            (String::new(), None)
         };
-
-        let working_dir = std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from("."));
 
         let language = current_file
             .as_deref()
             .map(Language::from_path)
             .unwrap_or(Language::Brief);
 
-        Self {
+        let editor = Self {
             content,
             cursor_position: 0,
             selection_start: None,
@@ -307,7 +311,23 @@ impl TextEditor {
             drag_start_position: 0,
             window_width: 800.0,
             language,
-        }
+            cursor_blink_visible: true,
+            cursor_blink_reset_position: 0,
+            scroll_viewport_bounds: None,
+        };
+
+        cx.spawn(async move |this, cx| {
+            loop {
+                Timer::after(Duration::from_millis(530)).await;
+                let _ = this.update(cx, |editor, cx| {
+                    editor.cursor_blink_visible = !editor.cursor_blink_visible;
+                    cx.notify();
+                });
+            }
+        })
+        .detach();
+
+        editor
     }
 
     /// Produces colored runs for one source line by dispatching to the
@@ -375,6 +395,68 @@ impl TextEditor {
         } else {
             (width / cw).max(10.0) as usize
         }
+    }
+
+    fn should_show_cursor(&self) -> bool {
+        self.cursor_blink_visible || self.is_dragging
+    }
+
+    /// Maps a display column (monospace character index) to a byte offset within `segment`.
+    fn char_col_to_byte_offset(segment: &str, char_col: usize) -> usize {
+        if segment.is_empty() {
+            return 0;
+        }
+
+        let mut chars_seen = 0;
+        for (byte_idx, _ch) in segment.char_indices() {
+            if chars_seen >= char_col {
+                return byte_idx;
+            }
+            chars_seen += 1;
+        }
+
+        segment.len()
+    }
+
+    /// Converts a window-space click position to a document byte offset.
+    ///
+    /// Uses the same visual-line model as rendering and keyboard navigation.
+    /// Y is mapped via the measured scroll viewport bounds when available.
+    fn byte_offset_at_pixel(&self, position: Point<Pixels>) -> usize {
+        let char_width = self.char_width();
+        let line_height = self.line_height();
+        let padding = self.padding();
+        let gutter = self.gutter_width();
+
+        // X: window position minus chrome before the text column (validated layout).
+        let click_x: f32 = (position.x - px(padding) - px(gutter)).into();
+
+        // Y: use measured viewport top so we don't rely on estimated header height.
+        let click_y: f32 = if let Some(bounds) = &self.scroll_viewport_bounds {
+            (position.y - bounds.top() + px(self.scroll_offset)).into()
+        } else {
+            (position.y - px(padding) - px(self.header_height()) + px(self.scroll_offset)).into()
+        };
+
+        let visual_lines = self.build_visual_lines();
+        if visual_lines.is_empty() {
+            return 0;
+        }
+
+        let visual_line_idx = (click_y / line_height).max(0.0).floor() as usize;
+        let visual_line_idx = visual_line_idx.min(visual_lines.len() - 1);
+        let vl = &visual_lines[visual_line_idx];
+
+        let char_col = if click_x <= 0.0 {
+            0
+        } else {
+            (click_x / char_width).round() as usize
+        };
+
+        let segment = &self.content[vl.start_byte_in_content..vl.end_byte_in_content];
+        let byte_in_segment = Self::char_col_to_byte_offset(segment, char_col);
+
+        (vl.start_byte_in_content + byte_in_segment).min(self.content.len())
     }
 
     /// Records an edit operation to the undo stack.
@@ -1512,44 +1594,53 @@ impl TextEditor {
 
     /// Handles Ctrl+S (Save) action.
     ///
-    /// Behavior:
-    /// - If `current_file` is set: writes content to that path
-    /// - Otherwise: prompts for file path via stdin (blocking)
-    ///
-    /// # Limitations
-    ///
-    /// - Stdin prompt is blocking and non-ideal for GUI application
-    /// - Consider implementing modal dialog for file path input
-    /// - No dirty flag tracking or save confirmation yet
-    fn handle_save(&mut self, _: &Save, _: &mut Window, _cx: &mut Context<Self>) {
-        use std::io::{self, Write};
-
-        let path = if let Some(ref current) = self.current_file {
-            current.clone()
-        } else {
-            print!("Enter file path to save: ");
-            io::stdout().flush().unwrap();
-            let mut input = String::new();
-            if io::stdin().read_line(&mut input).is_ok() {
-                input.trim().to_string()
+    /// - If a `current_file` is set, writes directly to that path.
+    /// - Otherwise (draft buffer), opens a native Save-As dialog. Once the
+    ///   user picks a destination, the file is written and the editor adopts
+    ///   that path (and its parent as `working_dir` for fuzzy find).
+    fn handle_save(&mut self, _: &Save, _: &mut Window, cx: &mut Context<Self>) {
+        if let Some(path) = self.current_file.clone() {
+            if let Err(e) = std::fs::write(&path, &self.content) {
+                eprintln!("Failed to save file: {}", e);
             } else {
-                eprintln!("Failed to read input");
-                return;
+                self.is_dirty = false;
+                println!("File saved to: {}", path);
+                cx.notify();
             }
-        };
-
-        if path.is_empty() {
-            eprintln!("No file path provided");
             return;
         }
 
-        if let Err(e) = std::fs::write(&path, &self.content) {
-            eprintln!("Failed to save file: {}", e);
-        } else {
-            self.current_file = Some(path.clone());
-            self.is_dirty = false;
-            println!("File saved to: {}", path);
-        }
+        let directory = self
+            .working_dir
+            .clone()
+            .or_else(|| std::env::current_dir().ok())
+            .unwrap_or_else(|| PathBuf::from("."));
+        let suggested = match self.language {
+            Language::Brief => "untitled.brf",
+            Language::Markdown => "untitled.md",
+        };
+        let rx = cx.prompt_for_new_path(&directory, Some(suggested));
+        cx.spawn(async move |this, cx| {
+            let Ok(Ok(Some(path))) = rx.await else {
+                return;
+            };
+            let _ = this.update(cx, |editor, cx| {
+                if let Err(e) = std::fs::write(&path, &editor.content) {
+                    eprintln!("Failed to save file: {}", e);
+                    return;
+                }
+                let path_str = path.to_string_lossy().to_string();
+                editor.language = Language::from_path(&path_str);
+                editor.current_file = Some(path_str.clone());
+                editor.is_dirty = false;
+                if editor.working_dir.is_none() {
+                    editor.working_dir = path.parent().map(|p| p.to_path_buf());
+                }
+                println!("File saved to: {}", path_str);
+                cx.notify();
+            });
+        })
+        .detach();
     }
 
     /// Handles Ctrl+Q (Quit) action by terminating the application.
@@ -1698,8 +1789,12 @@ impl TextEditor {
         }
     }
 
-    /// Handles Ctrl+P (Toggle Palette) action.
-    /// Opens or closes the command palette for fuzzy file finding.
+    /// Handles Ctrl+P / Ctrl+O (Toggle Palette) action.
+    ///
+    /// - If a `working_dir` is set, opens the fuzzy-find palette over that
+    ///   folder (existing behavior).
+    /// - In draft mode (no `working_dir`), opens the native OS file picker
+    ///   instead, so the editor never scans the filesystem on its own.
     fn handle_toggle_palette(
         &mut self,
         _: &TogglePalette,
@@ -1707,20 +1802,79 @@ impl TextEditor {
         cx: &mut Context<Self>,
     ) {
         if self.palette.is_some() {
-            // Close palette and restore focus to editor
             self.palette = None;
             window.focus(&self.focus_handle);
-        } else {
-            self.close_find_panel();
-            // Open palette and transfer focus to it
-            let working_dir = self.working_dir.clone();
+            cx.notify();
+            return;
+        }
+
+        self.close_find_panel();
+
+        if let Some(working_dir) = self.working_dir.clone() {
             let palette_theme = self.config.theme().palette.clone();
             let palette_entity =
                 cx.new(move |cx| Palette::new(working_dir.clone(), palette_theme.clone(), cx));
             window.focus(&palette_entity.read(cx).focus_handle(cx));
             self.palette = Some(palette_entity);
+            cx.notify();
+            return;
         }
-        cx.notify();
+
+        // Draft mode: bring up the native file dialog and load whatever the
+        // user picks. If the current draft is dirty, the file opens in a new
+        // window so unsaved work isn't clobbered.
+        let rx = cx.prompt_for_paths(PathPromptOptions {
+            files: true,
+            directories: false,
+            multiple: false,
+            prompt: None,
+        });
+        let config = self.config.clone();
+        cx.spawn(async move |this, cx| {
+            let Ok(Ok(Some(paths))) = rx.await else {
+                return;
+            };
+            let Some(path) = paths.into_iter().next() else {
+                return;
+            };
+            let _ = this.update(cx, |editor, cx| {
+                if editor.is_dirty {
+                    let path_str = path.to_string_lossy().to_string();
+                    let parent = path.parent().map(|p| p.to_path_buf());
+                    open_editor_window(Some(path_str), parent, config.clone(), cx);
+                } else {
+                    editor.load_file(path, cx);
+                }
+            });
+        })
+        .detach();
+    }
+
+    /// Handles Ctrl+Shift+O (Open Folder).
+    ///
+    /// Always opens a native folder picker; the selected folder is opened in
+    /// a brand-new window with a fresh draft buffer, leaving the current
+    /// window untouched.
+    fn handle_open_folder(&mut self, _: &OpenFolder, _: &mut Window, cx: &mut Context<Self>) {
+        let rx = cx.prompt_for_paths(PathPromptOptions {
+            files: false,
+            directories: true,
+            multiple: false,
+            prompt: None,
+        });
+        let config = self.config.clone();
+        cx.spawn(async move |_this, cx| {
+            let Ok(Ok(Some(paths))) = rx.await else {
+                return;
+            };
+            let Some(folder) = paths.into_iter().next() else {
+                return;
+            };
+            let _ = cx.update(|cx| {
+                open_editor_window(None, Some(folder), config.clone(), cx);
+            });
+        })
+        .detach();
     }
 
     /// Handles Ctrl+Z (Undo) action.
@@ -1792,8 +1946,10 @@ impl TextEditor {
     /// Loads a file into the editor.
     ///
     /// This method reads the file content and updates the editor state.
-    /// Called when a file is selected from the palette.
-    fn load_file(&mut self, path: std::path::PathBuf, cx: &mut Context<Self>) {
+    /// Called when a file is selected from the palette or the native picker.
+    /// When the editor has no `working_dir` yet (draft mode), it adopts the
+    /// file's parent directory so subsequent Ctrl+P uses fuzzy find.
+    fn load_file(&mut self, path: PathBuf, cx: &mut Context<Self>) {
         match std::fs::read_to_string(&path) {
             Ok(content) => {
                 self.content = content;
@@ -1802,6 +1958,9 @@ impl TextEditor {
                 self.scroll_offset = 0.0;
                 let path_str = path.to_string_lossy().to_string();
                 self.language = Language::from_path(&path_str);
+                if self.working_dir.is_none() {
+                    self.working_dir = path.parent().map(|p| p.to_path_buf());
+                }
                 self.current_file = Some(path_str);
                 self.is_dirty = false;
                 self.undo_stack.clear();
@@ -1817,48 +1976,17 @@ impl TextEditor {
 
     /// Handles mouse click events for cursor positioning.
     ///
-    /// Converts pixel coordinates to document position by:
-    /// 1. Calculating clicked line from Y coordinate
-    /// 2. Calculating column from X coordinate
-    /// 3. Converting (line, column) to byte offset
+    /// Converts a mouse click position to a document byte offset.
     ///
-    /// # Layout Metrics
-    ///
-    /// Values derive from the configured font size. Defaults (font-size 14px) yield:
-    /// - `char_width` ≈ 8px (monospace width)
-    /// - `line_height` ≈ 20px
-    /// - `header_height` ≈ 28px (line height + header spacing)
-    /// - `padding` = 16px (p_4)
+    /// Hit-testing uses the same visual-line word-wrap model as rendering and
+    /// keyboard navigation, with gutter width and scroll offset accounted for.
     fn handle_mouse_down(&mut self, event: &MouseDownEvent, cx: &mut Context<Self>) {
         self.clear_selection();
 
-        let char_width = px(self.char_width());
-        let line_height = px(self.line_height());
-        let header_height = px(self.header_height());
-        let padding = px(self.padding());
-
-        let click_x = event.position.x - padding;
-        let click_y = event.position.y - padding - header_height + px(self.scroll_offset);
-
-        let clicked_line = ((click_y / line_height).max(0.0).floor() as usize).max(0);
-
-        let clicked_col = ((click_x / char_width).max(0.0).round() as usize).max(0);
-
-        let lines: Vec<&str> = self.content.split('\n').collect();
-
-        let target_line = clicked_line.min(lines.len().saturating_sub(1));
-
-        let mut byte_position = 0;
-        for (idx, line) in lines.iter().enumerate() {
-            if idx == target_line {
-                let target_col = clicked_col.min(line.len());
-                byte_position += target_col;
-                break;
-            }
-            byte_position += line.len() + 1;
-        }
+        let byte_position = self.byte_offset_at_pixel(event.position);
 
         self.cursor_position = byte_position;
+        self.cursor_blink_visible = true;
         self.is_dragging = true;
         self.drag_start_position = byte_position;
         cx.notify();
@@ -1870,31 +1998,10 @@ impl TextEditor {
             return;
         }
 
-        let char_width = px(self.char_width());
-        let line_height = px(self.line_height());
-        let header_height = px(self.header_height());
-        let padding = px(self.padding());
-
-        let move_x = event.position.x - padding;
-        let move_y = event.position.y - padding - header_height + px(self.scroll_offset);
-
-        let moved_line = ((move_y / line_height).max(0.0).floor() as usize).max(0);
-        let moved_col = ((move_x / char_width).max(0.0).round() as usize).max(0);
-
-        let lines: Vec<&str> = self.content.split('\n').collect();
-        let target_line = moved_line.min(lines.len().saturating_sub(1));
-
-        let mut byte_position = 0;
-        for (idx, line) in lines.iter().enumerate() {
-            if idx == target_line {
-                let target_col = moved_col.min(line.len());
-                byte_position += target_col;
-                break;
-            }
-            byte_position += line.len() + 1;
-        }
+        let byte_position = self.byte_offset_at_pixel(event.position);
 
         self.cursor_position = byte_position;
+        self.cursor_blink_visible = true;
         self.selection_start = Some(self.drag_start_position);
         cx.notify();
     }
@@ -2105,6 +2212,14 @@ impl Render for TextEditor {
         let theme = self.config.theme().clone();
         let font_family = "monospace";
 
+        if self.cursor_position != self.cursor_blink_reset_position {
+            self.cursor_blink_visible = true;
+            self.cursor_blink_reset_position = self.cursor_position;
+        }
+
+        let show_cursor = self.should_show_cursor();
+        let entity = cx.entity().downgrade();
+
         let editor_content = div()
             .track_focus(&self.focus_handle(cx))
             .on_mouse_down(
@@ -2144,6 +2259,7 @@ impl Render for TextEditor {
             .on_action(cx.listener(Self::handle_find_previous))
             .on_action(cx.listener(Self::handle_toggle_goto_line))
             .on_action(cx.listener(Self::handle_toggle_palette))
+            .on_action(cx.listener(Self::handle_open_folder))
             .on_action(cx.listener(Self::handle_undo))
             .on_action(cx.listener(Self::handle_redo))
             .on_mouse_move(cx.listener(|editor, event: &gpui::MouseMoveEvent, _, cx| {
@@ -2234,144 +2350,165 @@ impl Render for TextEditor {
             .p_4()
             .font_family(font_family)
             .text_size(px(self.font_size()))
+            .line_height(px(self.line_height()))
             .child(
                 div()
                     .mb_2()
                     .text_color(theme.editor.muted_text)
                     .child(format!(
-                        "MedleyText - {} | Ctrl+P: files | Ctrl+S: save | Ctrl+Q: quit",
+                        "MedleyText - {} | Ctrl+P: open file | Ctrl+Shift+O: open folder | Ctrl+S: save | Ctrl+Q: quit",
                         self.current_file
                             .as_ref()
                             .map(|p| p.as_str())
-                            .unwrap_or("[unsaved]")
+                            .unwrap_or("[Draft]")
                     )),
             )
-            .child(
+            .child({
+                let entity = entity.clone();
                 div()
                     .flex()
                     .flex_col()
-                    .gap_1()
                     .flex_1()
                     .overflow_hidden()
-                    .child(div().flex().flex_col().mt(px(-self.scroll_offset)).child({
-                        let selection_range = self.get_selection_range();
-                        let visual_lines = self.build_visual_lines();
-                        let mut result = div().flex().flex_col();
-                        let gutter_width = self.gutter_width();
-                        let content_line_height = self.cursor_height();
+                    .relative()
+                    .child(
+                        canvas(
+                            {
+                                let entity = entity.clone();
+                                move |bounds, _window, cx| {
+                                    let _ = entity.update(cx, |editor, _| {
+                                        editor.scroll_viewport_bounds = Some(bounds);
+                                    });
+                                }
+                            },
+                            |_, _, _, _| {},
+                        )
+                        .absolute()
+                        .size_full(),
+                    )
+                    .child(div().size_full().overflow_hidden().child(
+                        div().flex().flex_col().mt(px(-self.scroll_offset)).child({
+                            let selection_range = self.get_selection_range();
+                            let visual_lines = self.build_visual_lines();
+                            let mut result = div().flex().flex_col();
+                            let gutter_width = self.gutter_width();
+                            let row_height = self.line_height();
+                            let cursor_bar_height = self.cursor_height();
 
-                        for vl in visual_lines.iter() {
-                            let mut line_wrapper =
-                                div().flex().flex_row().min_h(px(content_line_height));
+                            for vl in visual_lines.iter() {
+                                let mut line_wrapper = div().flex().flex_row().h(px(row_height));
 
-                            // Line number gutter (only on first visual line of content line)
-                            if vl.is_first {
-                                line_wrapper = line_wrapper.child(
-                                    div()
-                                        .w(px(gutter_width))
-                                        .flex()
-                                        .justify_end()
-                                        .pr_2()
-                                        .text_color(theme.editor.muted_text)
-                                        .child(format!("{}", vl.content_line + 1)),
-                                );
-                            } else {
-                                line_wrapper = line_wrapper.child(div().w(px(gutter_width)));
-                            }
-
-                            let mut line_div =
-                                div().flex().flex_row().min_h(px(content_line_height));
-
-                            // Find parent line boundaries for tokenization
-                            let parent_line_start = self.content[..vl.start_byte_in_content]
-                                .rfind('\n')
-                                .map(|p| p + 1)
-                                .unwrap_or(0);
-                            let parent_line_end = self.content[vl.start_byte_in_content..]
-                                .find('\n')
-                                .map(|p| vl.start_byte_in_content + p)
-                                .unwrap_or(self.content.len());
-                            let parent_text = &self.content[parent_line_start..parent_line_end];
-                            let runs = self.line_runs(parent_text, &theme.syntax);
-
-                            let mut token_byte = parent_line_start;
-                            for (text, token_color) in runs {
-                                let token_start = token_byte;
-                                let token_end = token_byte + text.len();
-
-                                if token_end <= vl.start_byte_in_content
-                                    || token_start >= vl.end_byte_in_content
-                                {
-                                    token_byte += text.len();
-                                    continue;
+                                // Line number gutter (only on first visual line of content line)
+                                if vl.is_first {
+                                    line_wrapper = line_wrapper.child(
+                                        div()
+                                            .w(px(gutter_width))
+                                            .flex()
+                                            .justify_end()
+                                            .pr_2()
+                                            .text_color(theme.editor.muted_text)
+                                            .child(format!("{}", vl.content_line + 1)),
+                                    );
+                                } else {
+                                    line_wrapper = line_wrapper.child(div().w(px(gutter_width)));
                                 }
 
-                                let overlap_start = token_start.max(vl.start_byte_in_content);
-                                let overlap_end = token_end.min(vl.end_byte_in_content);
-                                let overlap_text = &self.content[overlap_start..overlap_end];
-                                let cursor_pos = if self.cursor_position >= overlap_start
-                                    && self.cursor_position <= overlap_end
-                                {
-                                    Some(self.cursor_position)
-                                } else {
-                                    None
-                                };
+                                let mut line_div = div().flex().flex_row().h(px(row_height));
 
-                                let segments = self.build_segments_for_token(
-                                    overlap_text,
-                                    token_color,
-                                    overlap_start,
-                                    selection_range,
-                                    cursor_pos,
-                                    self.find_panel.as_ref(),
-                                    &theme,
-                                );
+                                // Find parent line boundaries for tokenization
+                                let parent_line_start = self.content[..vl.start_byte_in_content]
+                                    .rfind('\n')
+                                    .map(|p| p + 1)
+                                    .unwrap_or(0);
+                                let parent_line_end = self.content[vl.start_byte_in_content..]
+                                    .find('\n')
+                                    .map(|p| vl.start_byte_in_content + p)
+                                    .unwrap_or(self.content.len());
+                                let parent_text = &self.content[parent_line_start..parent_line_end];
+                                let runs = self.line_runs(parent_text, &theme.syntax);
 
-                                for segment in segments {
-                                    match segment {
-                                        SegmentPiece::Cursor => {
-                                            line_div = line_div.child(
-                                                div()
-                                                    .w(px(4.0))
-                                                    .h(px(content_line_height))
-                                                    .bg(theme.editor.cursor),
-                                            );
-                                        }
-                                        SegmentPiece::Text(run) => {
-                                            if run.text.is_empty() {
-                                                continue;
+                                let mut token_byte = parent_line_start;
+                                for (text, token_color) in runs {
+                                    let token_start = token_byte;
+                                    let token_end = token_byte + text.len();
+
+                                    if token_end <= vl.start_byte_in_content
+                                        || token_start >= vl.end_byte_in_content
+                                    {
+                                        token_byte += text.len();
+                                        continue;
+                                    }
+
+                                    let overlap_start = token_start.max(vl.start_byte_in_content);
+                                    let overlap_end = token_end.min(vl.end_byte_in_content);
+                                    let overlap_text = &self.content[overlap_start..overlap_end];
+                                    let cursor_pos = if self.cursor_position >= overlap_start
+                                        && self.cursor_position <= overlap_end
+                                    {
+                                        Some(self.cursor_position)
+                                    } else {
+                                        None
+                                    };
+
+                                    let segments = self.build_segments_for_token(
+                                        overlap_text,
+                                        token_color,
+                                        overlap_start,
+                                        selection_range,
+                                        cursor_pos,
+                                        self.find_panel.as_ref(),
+                                        &theme,
+                                    );
+
+                                    for segment in segments {
+                                        match segment {
+                                            SegmentPiece::Cursor => {
+                                                if show_cursor {
+                                                    line_div = line_div.child(
+                                                        div()
+                                                            .w(px(4.0))
+                                                            .h(px(cursor_bar_height))
+                                                            .bg(theme.editor.cursor),
+                                                    );
+                                                }
                                             }
-                                            let mut node = div().text_color(run.text_color);
-                                            if let Some(bg) = run.background {
-                                                node = node.bg(bg);
+                                            SegmentPiece::Text(run) => {
+                                                if run.text.is_empty() {
+                                                    continue;
+                                                }
+                                                let mut node = div().text_color(run.text_color);
+                                                if let Some(bg) = run.background {
+                                                    node = node.bg(bg);
+                                                }
+                                                line_div = line_div.child(node.child(run.text));
                                             }
-                                            line_div = line_div.child(node.child(run.text));
                                         }
                                     }
+
+                                    token_byte += text.len();
                                 }
 
-                                token_byte += text.len();
+                                // Cursor at end of visual line
+                                if show_cursor
+                                    && self.cursor_position == vl.end_byte_in_content
+                                    && self.cursor_position <= self.content.len()
+                                {
+                                    line_div = line_div.child(
+                                        div()
+                                            .w(px(4.0))
+                                            .h(px(cursor_bar_height))
+                                            .bg(theme.editor.cursor),
+                                    );
+                                }
+
+                                line_wrapper = line_wrapper.child(line_div);
+                                result = result.child(line_wrapper);
                             }
 
-                            // Cursor at end of visual line
-                            if self.cursor_position == vl.end_byte_in_content
-                                && self.cursor_position <= self.content.len()
-                            {
-                                line_div = line_div.child(
-                                    div()
-                                        .w(px(4.0))
-                                        .h(px(content_line_height))
-                                        .bg(theme.editor.cursor),
-                                );
-                            }
-
-                            line_wrapper = line_wrapper.child(line_div);
-                            result = result.child(line_wrapper);
-                        }
-
-                        result
-                    })),
-            )
+                            result
+                        }),
+                    ))
+            })
             .child(
                 div()
                     .mt_2()
@@ -2606,4 +2743,27 @@ impl Render for TextEditor {
 
         container
     }
+}
+
+/// Opens a fresh editor window. Used both at startup and when the user picks
+/// "Open Folder" — opening a folder must spawn a new window so the current
+/// draft is left untouched.
+pub fn open_editor_window(
+    file_path: Option<String>,
+    working_dir: Option<PathBuf>,
+    config: EditorConfig,
+    cx: &mut App,
+) {
+    let bounds = Bounds::centered(None, size(px(800.0), px(600.0)), cx);
+    cx.open_window(
+        WindowOptions {
+            window_bounds: Some(WindowBounds::Windowed(bounds)),
+            is_movable: true,
+            ..Default::default()
+        },
+        move |_window, cx| {
+            cx.new(move |cx| TextEditor::with_file(file_path, working_dir, config, cx))
+        },
+    )
+    .ok();
 }

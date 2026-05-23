@@ -11,38 +11,33 @@ mod find;
 mod markdown;
 mod palette;
 
+use std::path::PathBuf;
+
 use config::EditorConfig;
-use editor::TextEditor;
-use gpui::{
-    App, AppContext, Application, Bounds, KeyBinding, WindowBounds, WindowOptions, px, size,
-};
+use editor::open_editor_window;
+use gpui::{App, Application, KeyBinding};
 
 /// Application entry point.
 ///
-/// Accepts an optional file path as the first command-line argument.
-/// If provided, the file will be loaded into the editor on startup.
-/// If the file doesn't exist, a new empty buffer with that filename is created.
+/// CLI argument handling, mirroring Notepad++-style launch semantics:
 ///
-/// # Examples
-///
-/// ```bash
-/// # Open existing file
-/// medleytext document.md
-///
-/// # Start with empty buffer
-/// medleytext
-/// ```
+/// - `medleytext`                  → empty draft buffer, no working folder.
+/// - `medleytext path/to/file.brf` → loads that file (creates a buffer for a
+///                                   missing path; nothing is written to disk
+///                                   until the user saves).
+/// - `medleytext path/to/folder/`  → opens a draft buffer scoped to that
+///                                   folder for Ctrl+P fuzzy find.
 fn main() {
     let args: Vec<String> = std::env::args().collect();
-    let file_path = args.get(1).cloned();
+    let (initial_file, initial_dir) = parse_cli_arg(args.get(1).map(String::as_str));
     let editor_config = EditorConfig::load();
 
     Application::new().run(move |cx: &mut App| {
         use editor::{
             Backspace, Copy, Cut, Delete, Enter, FindNext, FindPrevious, MoveDown, MoveEnd,
-            MoveHome, MoveLeft, MoveRight, MoveUp, MoveWordLeft, MoveWordRight, Paste, Quit, Redo,
-            Save, SelectAll, SelectDown, SelectLeft, SelectRight, SelectUp, ShiftTab, Tab,
-            ToggleFind, ToggleGoToLine, TogglePalette, Undo,
+            MoveHome, MoveLeft, MoveRight, MoveUp, MoveWordLeft, MoveWordRight, OpenFolder, Paste,
+            Quit, Redo, Save, SelectAll, SelectDown, SelectLeft, SelectRight, SelectUp, ShiftTab,
+            Tab, ToggleFind, ToggleGoToLine, TogglePalette, Undo,
         };
 
         // Configure global keybindings for the application.
@@ -74,6 +69,7 @@ fn main() {
             KeyBinding::new("ctrl-a", SelectAll, None),
             KeyBinding::new("ctrl-p", TogglePalette, None),
             KeyBinding::new("ctrl-o", TogglePalette, None),
+            KeyBinding::new("ctrl-shift-o", OpenFolder, None),
             KeyBinding::new("ctrl-f", ToggleFind, None),
             KeyBinding::new("ctrl-g", ToggleGoToLine, None),
             KeyBinding::new("f3", FindNext, None),
@@ -83,20 +79,29 @@ fn main() {
             KeyBinding::new("ctrl-y", Redo, None),
         ]);
 
-        // Create a resizable window centered on screen with initial size of 800x600.
-        let bounds = Bounds::centered(None, size(px(800.0), px(600.0)), cx);
-        let file_path_clone = file_path.clone();
-        let config_for_window = editor_config.clone();
-        cx.open_window(
-            WindowOptions {
-                window_bounds: Some(WindowBounds::Windowed(bounds)),
-                is_movable: true,
-                ..Default::default()
-            },
-            |_window, cx| {
-                cx.new(|cx| TextEditor::with_file(file_path_clone, config_for_window, cx))
-            },
-        )
-        .unwrap();
+        open_editor_window(
+            initial_file.clone(),
+            initial_dir.clone(),
+            editor_config.clone(),
+            cx,
+        );
     });
+}
+
+/// Interprets the optional first CLI argument as either a file or a folder.
+///
+/// A path pointing at an existing directory becomes the window's
+/// `working_dir`; anything else (existing file, missing file, or no arg) is
+/// treated as a file path to load. The "missing path" branch matches
+/// Notepad++ behavior where a user can pre-name a file before saving.
+fn parse_cli_arg(arg: Option<&str>) -> (Option<String>, Option<PathBuf>) {
+    let Some(arg) = arg else {
+        return (None, None);
+    };
+    let path = PathBuf::from(arg);
+    if path.is_dir() {
+        (None, Some(path))
+    } else {
+        (Some(arg.to_string()), None)
+    }
 }
