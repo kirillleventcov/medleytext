@@ -5,6 +5,7 @@
 
 mod autocomplete;
 mod brief;
+mod compile;
 mod config;
 mod editor;
 mod find;
@@ -34,10 +35,11 @@ fn main() {
 
     Application::new().run(move |cx: &mut App| {
         use editor::{
-            Backspace, Copy, Cut, Delete, Enter, FindNext, FindPrevious, MoveDown, MoveEnd,
-            MoveHome, MoveLeft, MoveRight, MoveUp, MoveWordLeft, MoveWordRight, OpenFolder, Paste,
-            Quit, Redo, Save, SelectAll, SelectDown, SelectLeft, SelectRight, SelectUp, ShiftTab,
-            Tab, ToggleFind, ToggleGoToLine, TogglePalette, Undo,
+            Backspace, Copy, Cut, Delete, Enter, ExportHtml, FindNext, FindPrevious, MoveDown,
+            MoveEnd, MoveHome, MoveLeft, MoveRight, MoveUp, MoveWordLeft, MoveWordRight,
+            NextDiagnostic, OpenFolder, Paste, Quit, Redo, Save, SelectAll, SelectDown, SelectLeft,
+            SelectRight, SelectUp, ShiftTab, Tab, ToggleDiagnostics, ToggleFind, ToggleGoToLine,
+            TogglePalette, Undo,
         };
 
         // Configure global keybindings for the application.
@@ -77,6 +79,9 @@ fn main() {
             KeyBinding::new("ctrl-z", Undo, None),
             KeyBinding::new("ctrl-shift-z", Redo, None),
             KeyBinding::new("ctrl-y", Redo, None),
+            KeyBinding::new("ctrl-e", ExportHtml, None),
+            KeyBinding::new("ctrl-shift-d", ToggleDiagnostics, None),
+            KeyBinding::new("f8", NextDiagnostic, None),
         ]);
 
         open_editor_window(

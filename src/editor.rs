@@ -7,8 +7,8 @@
 
 use gpui::{
     App, Bounds, ClipboardItem, Context, FocusHandle, Focusable, KeyDownEvent, MouseDownEvent,
-    PathPromptOptions, Pixels, Point, Render, Rgba, ScrollWheelEvent, Timer, Window, WindowBounds,
-    WindowOptions, actions, canvas, div, prelude::*, px, size,
+    PathPromptOptions, Pixels, Point, PromptLevel, Render, Rgba, ScrollWheelEvent, Timer, Window,
+    WindowBounds, WindowOptions, actions, canvas, div, prelude::*, px, size,
 };
 
 use std::path::{Path, PathBuf};
@@ -16,6 +16,7 @@ use std::time::Duration;
 
 use crate::autocomplete::Autocomplete;
 use crate::brief::BriefHighlighter;
+use crate::compile::{self, CompileDiagnostic};
 use crate::config::{EditorConfig, SyntaxTheme, Theme};
 use crate::find::{ActiveInput, FindPanelState, SearchMatch};
 use crate::markdown::MarkdownHighlighter;
@@ -79,24 +80,80 @@ actions!(
         OpenFolder,
         Undo,
         Redo,
+        ExportHtml,
+        ToggleDiagnostics,
+        NextDiagnostic,
     ]
 );
 
-/// Represents a single edit operation for undo/redo.
+/// Diagnostic gutter / underline colors. Hardcoded (not themed) so the
+/// editor stays usable without expanding the config surface.
+const DIAG_ERROR_COLOR: u32 = 0xe06c75;
+const DIAG_WARNING_COLOR: u32 = 0xe5c07b;
+
+/// Maximum number of undo records retained. Older edits fall off the bottom so
+/// memory can't grow without bound on a long editing session.
+const MAX_UNDO_HISTORY: usize = 1000;
+
+/// A single, compact edit for undo/redo.
+///
+/// Instead of snapshotting the whole document twice per keystroke (which made
+/// memory grow with `document_size × edits`), each record stores only the
+/// changed span: at byte `start`, the text `removed` was replaced by `inserted`.
+/// Undo splices `removed` back in; redo re-applies `inserted`.
 #[derive(Clone, Debug)]
 struct EditOperation {
-    /// Content before the edit
-    old_content: String,
-    /// Content after the edit
-    new_content: String,
-    /// Cursor position before the edit
+    /// Byte offset where the change begins (a char boundary in both versions).
+    start: usize,
+    /// Text that occupied `start..start+removed.len()` before the edit.
+    removed: String,
+    /// Text that occupies `start..start+inserted.len()` after the edit.
+    inserted: String,
+    /// Cursor position before the edit.
     old_cursor: usize,
-    /// Cursor position after the edit
+    /// Cursor position after the edit.
     new_cursor: usize,
-    /// Selection start before the edit
+    /// Selection start before the edit.
     old_selection: Option<usize>,
-    /// Selection start after the edit
+    /// Selection start after the edit.
     new_selection: Option<usize>,
+}
+
+/// Computes the minimal changed span between two document versions as
+/// `(start, removed, inserted)`, trimming the common prefix and suffix. All
+/// three boundaries are clamped to UTF-8 char boundaries so splicing the
+/// span back is always valid.
+fn compute_diff(old: &str, new: &str) -> (usize, String, String) {
+    let old_bytes = old.as_bytes();
+    let new_bytes = new.as_bytes();
+
+    // Longest common prefix, backed off to a shared char boundary.
+    let max_prefix = old_bytes.len().min(new_bytes.len());
+    let mut prefix = 0;
+    while prefix < max_prefix && old_bytes[prefix] == new_bytes[prefix] {
+        prefix += 1;
+    }
+    while prefix > 0 && (!old.is_char_boundary(prefix) || !new.is_char_boundary(prefix)) {
+        prefix -= 1;
+    }
+
+    // Longest common suffix that doesn't overlap the prefix, on a boundary.
+    let max_suffix = (old_bytes.len() - prefix).min(new_bytes.len() - prefix);
+    let mut suffix = 0;
+    while suffix < max_suffix
+        && old_bytes[old_bytes.len() - 1 - suffix] == new_bytes[new_bytes.len() - 1 - suffix]
+    {
+        suffix += 1;
+    }
+    while suffix > 0
+        && (!old.is_char_boundary(old.len() - suffix) || !new.is_char_boundary(new.len() - suffix))
+    {
+        suffix -= 1;
+    }
+
+    let removed = old[prefix..old.len() - suffix].to_string();
+    let inserted = new[prefix..new.len() - suffix].to_string();
+    (prefix, removed, inserted)
 }
 
 /// Core text editor component.
@@ -177,6 +234,10 @@ pub struct TextEditor {
     /// Cached window width for word-wrap calculations.
     window_width: f32,
 
+    /// Cached window height, used as a fallback for viewport sizing before the
+    /// scroll viewport has been measured during paint.
+    window_height: f32,
+
     /// Markup language driving highlighter, autocomplete, and smart-list
     /// continuation. Re-derived from the file extension on open/load.
     language: Language,
@@ -189,6 +250,19 @@ pub struct TextEditor {
 
     /// Window bounds of the scroll viewport, updated each frame during paint.
     scroll_viewport_bounds: Option<Bounds<Pixels>>,
+
+    /// Brief compiler diagnostics for the current buffer (empty for Markdown).
+    diagnostics: Vec<CompileDiagnostic>,
+
+    /// Set when the buffer changed and diagnostics need recomputing. Render
+    /// kicks off a debounced recompute when this is true.
+    diag_dirty: bool,
+
+    /// Monotonic token used to debounce/cancel stale diagnostic recomputes.
+    diag_generation: u64,
+
+    /// Whether the diagnostics list panel is visible.
+    show_diagnostics: bool,
 }
 
 #[derive(Clone)]
@@ -215,6 +289,15 @@ enum HighlightKind {
     Selection,
     SearchActive,
     SearchMatch,
+}
+
+/// How a content line should be highlighted, accounting for multi-line context
+/// (fenced code blocks and Brief block comments) the per-line tokenizers miss.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum LineMode {
+    Normal,
+    Code,
+    Comment,
 }
 
 impl HighlightKind {
@@ -310,10 +393,15 @@ impl TextEditor {
             is_dragging: false,
             drag_start_position: 0,
             window_width: 800.0,
+            window_height: 600.0,
             language,
             cursor_blink_visible: true,
             cursor_blink_reset_position: 0,
             scroll_viewport_bounds: None,
+            diagnostics: Vec::new(),
+            diag_dirty: true,
+            diag_generation: 0,
+            show_diagnostics: false,
         };
 
         cx.spawn(async move |this, cx| {
@@ -346,6 +434,70 @@ impl TextEditor {
         }
     }
 
+    /// Produces colored runs for one source line, honoring multi-line context.
+    ///
+    /// The per-line highlighters are stateless, so without this the *interior*
+    /// of fenced code blocks (and Brief `/* */` block comments) would be
+    /// tokenized as ordinary markup. `mode` is precomputed by
+    /// [`Self::compute_line_modes`] so interior lines render verbatim.
+    fn runs_for_line(
+        &self,
+        line: &str,
+        mode: LineMode,
+        syntax: &SyntaxTheme,
+    ) -> Vec<(String, Rgba)> {
+        match mode {
+            LineMode::Normal => self.line_runs(line, syntax),
+            LineMode::Code => vec![(line.to_string(), syntax.code_block)],
+            LineMode::Comment => vec![(line.to_string(), syntax.comment)],
+        }
+    }
+
+    /// Classifies every content line as normal markup, fenced-code interior, or
+    /// block-comment interior. Fence (```` ``` ````) handling applies to both
+    /// languages; `/* */` block comments are Brief-only. Marker lines stay
+    /// `Normal` so the per-line highlighter colors the fence/comment markers.
+    fn compute_line_modes(&self) -> Vec<LineMode> {
+        let brief = self.language == Language::Brief;
+        let mut modes = Vec::new();
+        let mut in_fence = false;
+        let mut in_comment = false;
+
+        for line in self.content.split('\n') {
+            let trimmed = line.trim_start_matches(' ');
+
+            if in_comment {
+                modes.push(LineMode::Comment);
+                if trimmed.ends_with("*/") {
+                    in_comment = false;
+                }
+                continue;
+            }
+
+            if in_fence {
+                if trimmed.starts_with("```") {
+                    in_fence = false;
+                    modes.push(LineMode::Normal); // closing fence marker
+                } else {
+                    modes.push(LineMode::Code);
+                }
+                continue;
+            }
+
+            if trimmed.starts_with("```") {
+                in_fence = true;
+                modes.push(LineMode::Normal); // opening fence marker
+            } else if brief && trimmed.starts_with("/*") && !trimmed[2..].contains("*/") {
+                in_comment = true;
+                modes.push(LineMode::Normal); // opening comment marker
+            } else {
+                modes.push(LineMode::Normal);
+            }
+        }
+
+        modes
+    }
+
     fn font_size(&self) -> f32 {
         self.config.font_size()
     }
@@ -375,7 +527,17 @@ impl TextEditor {
     }
 
     fn viewport_height(&self) -> f32 {
-        538.0 - 20.0 + self.line_height()
+        // Prefer the viewport height measured during paint (tracks window
+        // resizes exactly). Fall back to deriving it from the cached window
+        // height before the first paint.
+        if let Some(bounds) = &self.scroll_viewport_bounds {
+            let measured: f32 = bounds.size.height.into();
+            if measured > 0.0 {
+                return measured;
+            }
+        }
+        let chrome = self.padding() * 2.0 + self.header_height() + self.line_height() + 16.0;
+        (self.window_height - chrome).max(self.line_height())
     }
 
     fn gutter_width(&self) -> f32 {
@@ -459,20 +621,51 @@ impl TextEditor {
         (vl.start_byte_in_content + byte_in_segment).min(self.content.len())
     }
 
-    /// Records an edit operation to the undo stack.
+    /// Records an edit on the undo stack as a compact diff and clears redo.
     ///
-    /// This captures the state before and after an edit, allowing it to be undone later.
-    /// When a new edit is recorded, the redo stack is cleared.
+    /// Consecutive single-character typing is coalesced into one record (so one
+    /// Ctrl+Z undoes a whole word rather than a letter), breaking at whitespace
+    /// so the grouping feels natural. History is capped at
+    /// [`MAX_UNDO_HISTORY`] records.
     fn push_edit(&mut self, old_content: String, old_cursor: usize, old_selection: Option<usize>) {
-        let operation = EditOperation {
-            old_content,
-            new_content: self.content.clone(),
+        let (start, removed, inserted) = compute_diff(&old_content, &self.content);
+
+        // Nothing actually changed — don't record an empty operation.
+        if removed.is_empty() && inserted.is_empty() {
+            return;
+        }
+
+        // Try to merge a pure single-char insertion onto the previous record
+        // when it continues an uninterrupted typing run.
+        let is_pure_single_insert = removed.is_empty() && inserted.chars().count() == 1;
+        if is_pure_single_insert {
+            if let Some(prev) = self.undo_stack.last_mut() {
+                let prev_was_insert = prev.removed.is_empty();
+                let contiguous = prev.start + prev.inserted.len() == start;
+                let break_on_ws = inserted.starts_with(char::is_whitespace)
+                    || prev.inserted.ends_with(char::is_whitespace);
+                if prev_was_insert && contiguous && !break_on_ws {
+                    prev.inserted.push_str(&inserted);
+                    prev.new_cursor = self.cursor_position;
+                    prev.new_selection = self.selection_start;
+                    self.redo_stack.clear();
+                    return;
+                }
+            }
+        }
+
+        self.undo_stack.push(EditOperation {
+            start,
+            removed,
+            inserted,
             old_cursor,
             new_cursor: self.cursor_position,
             old_selection,
             new_selection: self.selection_start,
-        };
-        self.undo_stack.push(operation);
+        });
+        if self.undo_stack.len() > MAX_UNDO_HISTORY {
+            self.undo_stack.remove(0);
+        }
         self.redo_stack.clear();
     }
 
@@ -574,6 +767,31 @@ impl TextEditor {
             .unwrap_or(len)
     }
 
+    /// Byte offset of the char boundary immediately before `pos` (UTF-8 safe).
+    fn prev_char_boundary(&self, pos: usize) -> usize {
+        if pos == 0 {
+            return 0;
+        }
+        let mut p = pos - 1;
+        while p > 0 && !self.content.is_char_boundary(p) {
+            p -= 1;
+        }
+        p
+    }
+
+    /// Byte offset of the char boundary immediately after `pos` (UTF-8 safe).
+    fn next_char_boundary(&self, pos: usize) -> usize {
+        let len = self.content.len();
+        if pos >= len {
+            return len;
+        }
+        let mut p = pos + 1;
+        while p < len && !self.content.is_char_boundary(p) {
+            p += 1;
+        }
+        p
+    }
+
     /// Finds the start of the current line (byte offset).
     fn find_line_start(&self) -> usize {
         self.content[..self.cursor_position]
@@ -638,7 +856,11 @@ impl TextEditor {
     }
 
     /// Recomputes matches when content or query changes.
+    ///
+    /// This is the single hook every content mutation funnels through, so it
+    /// also flags diagnostics as stale; `render` debounces the recompute.
     fn refresh_search_matches(&mut self) {
+        self.diag_dirty = true;
         let has_panel = self.find_panel.is_some();
         if let Some(find) = self.find_panel.as_mut() {
             find.recompute_matches(&self.content);
@@ -647,6 +869,93 @@ impl TextEditor {
             if !self.focus_current_search_match() {
                 self.selection_start = None;
             }
+        }
+    }
+
+    /// Kicks off a debounced Brief diagnostics recompute.
+    ///
+    /// Markdown buffers have no Brief diagnostics, so they clear immediately.
+    /// For Brief, a generation token cancels stale recomputes: only the most
+    /// recent edit's analysis is stored, keeping typing responsive on large
+    /// files (compilation runs at most once per ~200ms quiet window).
+    fn schedule_diagnostics(&mut self, cx: &mut Context<Self>) {
+        self.diag_dirty = false;
+
+        if self.language != Language::Brief {
+            if !self.diagnostics.is_empty() {
+                self.diagnostics.clear();
+            }
+            return;
+        }
+
+        self.diag_generation = self.diag_generation.wrapping_add(1);
+        let generation = self.diag_generation;
+        let content = self.content.clone();
+        let path = self
+            .current_file
+            .clone()
+            .unwrap_or_else(|| "draft.brf".to_string());
+
+        cx.spawn(async move |this, cx| {
+            Timer::after(Duration::from_millis(200)).await;
+            let _ = this.update(cx, |editor, cx| {
+                // Drop this result if a newer edit superseded it.
+                if editor.diag_generation != generation {
+                    return;
+                }
+                let analysis = compile::analyze(&path, &content);
+                editor.diagnostics = analysis.diagnostics;
+                cx.notify();
+            });
+        })
+        .detach();
+    }
+
+    /// Counts errors / warnings in the current diagnostics.
+    fn diagnostic_counts(&self) -> (usize, usize) {
+        let errors = self.diagnostics.iter().filter(|d| d.is_error()).count();
+        (errors, self.diagnostics.len() - errors)
+    }
+
+    /// Highest-severity diagnostic kind on a given 1-indexed line, if any.
+    /// `Some(true)` = an error is present, `Some(false)` = only warnings.
+    fn line_diagnostic(&self, line: usize) -> Option<bool> {
+        let mut found_warning = false;
+        for diag in self.diagnostics.iter().filter(|d| d.line == line) {
+            if diag.is_error() {
+                return Some(true);
+            }
+            found_warning = true;
+        }
+        found_warning.then_some(false)
+    }
+
+    /// Moves the cursor to the next diagnostic after the current line, wrapping
+    /// around. No-op when there are no diagnostics.
+    fn goto_next_diagnostic(&mut self) {
+        if self.diagnostics.is_empty() {
+            return;
+        }
+        let current_line = self.get_current_line_number();
+        let mut lines: Vec<usize> = self.diagnostics.iter().map(|d| d.line).collect();
+        lines.sort_unstable();
+        lines.dedup();
+        let target = lines
+            .iter()
+            .copied()
+            .find(|&l| l > current_line)
+            .unwrap_or(lines[0]);
+
+        // Convert the 1-indexed line to a byte offset at the line start.
+        let mut byte = 0usize;
+        for (idx, line) in self.content.split('\n').enumerate() {
+            if idx + 1 == target {
+                self.cursor_position = byte;
+                self.selection_start = None;
+                self.ensure_position_visible(byte);
+                break;
+            }
+            byte += line.len() + 1;
         }
     }
 
@@ -1114,7 +1423,7 @@ impl TextEditor {
 
         self.delete_selection();
         self.content.insert(self.cursor_position, c);
-        self.cursor_position += 1;
+        self.cursor_position += c.len_utf8();
         self.is_dirty = true;
 
         self.push_edit(old_content, old_cursor, old_selection);
@@ -1160,7 +1469,8 @@ impl TextEditor {
 
         if !self.delete_selection() {
             if self.cursor_position > 0 {
-                self.cursor_position -= 1;
+                // Remove the whole previous char (UTF-8 safe).
+                self.cursor_position = self.prev_char_boundary(self.cursor_position);
                 self.content.remove(self.cursor_position);
                 self.is_dirty = true;
             } else {
@@ -1503,7 +1813,7 @@ impl TextEditor {
         self.autocomplete = None;
         self.clear_selection();
         if self.cursor_position > 0 {
-            self.cursor_position -= 1;
+            self.cursor_position = self.prev_char_boundary(self.cursor_position);
             cx.notify();
         }
     }
@@ -1514,7 +1824,7 @@ impl TextEditor {
         self.autocomplete = None;
         self.clear_selection();
         if self.cursor_position < self.content.len() {
-            self.cursor_position += 1;
+            self.cursor_position = self.next_char_boundary(self.cursor_position);
             cx.notify();
         }
     }
@@ -1633,6 +1943,7 @@ impl TextEditor {
                 editor.language = Language::from_path(&path_str);
                 editor.current_file = Some(path_str.clone());
                 editor.is_dirty = false;
+                editor.diag_dirty = true;
                 if editor.working_dir.is_none() {
                     editor.working_dir = path.parent().map(|p| p.to_path_buf());
                 }
@@ -1643,9 +1954,30 @@ impl TextEditor {
         .detach();
     }
 
-    /// Handles Ctrl+Q (Quit) action by terminating the application.
-    fn handle_quit(&mut self, _: &Quit, _: &mut Window, cx: &mut Context<Self>) {
-        cx.quit();
+    /// Handles Ctrl+Q (Quit) action.
+    ///
+    /// Quits immediately for a clean buffer; otherwise shows a confirmation
+    /// dialog so unsaved work isn't discarded silently.
+    fn handle_quit(&mut self, _: &Quit, window: &mut Window, cx: &mut Context<Self>) {
+        if !self.is_dirty {
+            cx.quit();
+            return;
+        }
+
+        let answer = window.prompt(
+            PromptLevel::Warning,
+            "You have unsaved changes.",
+            Some("Quit without saving? Your changes will be lost."),
+            &["Quit without saving", "Cancel"],
+            cx,
+        );
+        cx.spawn(async move |_this, cx| {
+            // Answer index 0 is "Quit without saving".
+            if let Ok(0) = answer.await {
+                let _ = cx.update(|cx| cx.quit());
+            }
+        })
+        .detach();
     }
 
     /// Handles Ctrl+C (Copy) action.
@@ -1704,7 +2036,7 @@ impl TextEditor {
             self.selection_start = Some(self.cursor_position);
         }
         if self.cursor_position > 0 {
-            self.cursor_position -= 1;
+            self.cursor_position = self.prev_char_boundary(self.cursor_position);
             cx.notify();
         }
     }
@@ -1716,7 +2048,7 @@ impl TextEditor {
             self.selection_start = Some(self.cursor_position);
         }
         if self.cursor_position < self.content.len() {
-            self.cursor_position += 1;
+            self.cursor_position = self.next_char_boundary(self.cursor_position);
             cx.notify();
         }
     }
@@ -1878,11 +2210,13 @@ impl TextEditor {
     }
 
     /// Handles Ctrl+Z (Undo) action.
-    /// Reverts the last edit operation and moves it to the redo stack.
+    /// Reverts the last edit by splicing its removed text back in.
     fn handle_undo(&mut self, _: &Undo, _: &mut Window, cx: &mut Context<Self>) {
         if let Some(operation) = self.undo_stack.pop() {
-            self.content = operation.old_content.clone();
-            self.cursor_position = operation.old_cursor;
+            let end = operation.start + operation.inserted.len();
+            self.content
+                .replace_range(operation.start..end, &operation.removed);
+            self.cursor_position = operation.old_cursor.min(self.content.len());
             self.selection_start = operation.old_selection;
             self.redo_stack.push(operation);
             self.is_dirty = true;
@@ -1892,16 +2226,81 @@ impl TextEditor {
     }
 
     /// Handles Ctrl+Shift+Z or Ctrl+Y (Redo) action.
-    /// Reapplies an undone edit operation.
+    /// Re-applies an undone edit by splicing its inserted text back in.
     fn handle_redo(&mut self, _: &Redo, _: &mut Window, cx: &mut Context<Self>) {
         if let Some(operation) = self.redo_stack.pop() {
-            self.content = operation.new_content.clone();
-            self.cursor_position = operation.new_cursor;
+            let end = operation.start + operation.removed.len();
+            self.content
+                .replace_range(operation.start..end, &operation.inserted);
+            self.cursor_position = operation.new_cursor.min(self.content.len());
             self.selection_start = operation.new_selection;
             self.undo_stack.push(operation);
             self.is_dirty = true;
             self.refresh_search_matches();
             cx.notify();
+        }
+    }
+
+    /// Toggles the diagnostics list panel (Brief buffers only).
+    fn handle_toggle_diagnostics(
+        &mut self,
+        _: &ToggleDiagnostics,
+        _: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.show_diagnostics = !self.show_diagnostics;
+        cx.notify();
+    }
+
+    /// Jumps the cursor to the next diagnostic (F8), wrapping around.
+    fn handle_next_diagnostic(
+        &mut self,
+        _: &NextDiagnostic,
+        _: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.goto_next_diagnostic();
+        cx.notify();
+    }
+
+    /// Compiles the current Brief buffer to a standalone HTML file and opens it
+    /// in the system browser. Markdown buffers are skipped (no Brief compiler).
+    fn handle_export_html(&mut self, _: &ExportHtml, _: &mut Window, cx: &mut Context<Self>) {
+        if self.language != Language::Brief {
+            eprintln!("Export: HTML preview is only available for Brief buffers");
+            return;
+        }
+
+        let source_path = self
+            .current_file
+            .clone()
+            .unwrap_or_else(|| "draft.brf".to_string());
+        let title = Path::new(&source_path)
+            .file_stem()
+            .and_then(|s| s.to_str())
+            .unwrap_or("MedleyText")
+            .to_string();
+
+        match compile::render_html(&source_path, &self.content, &title) {
+            Ok(html) => {
+                let out_path = html_output_path(&source_path);
+                if let Err(e) = std::fs::write(&out_path, html) {
+                    eprintln!("Export: failed to write {}: {}", out_path.display(), e);
+                    return;
+                }
+                println!("Exported HTML to {}", out_path.display());
+                open_in_browser(&out_path);
+            }
+            Err(analysis) => {
+                eprintln!(
+                    "Export: document has {} error(s) and {} warning(s); fix the errors before exporting",
+                    analysis.error_count, analysis.warning_count
+                );
+                // Surface the errors in-editor too.
+                self.diagnostics = analysis.diagnostics;
+                self.show_diagnostics = true;
+                cx.notify();
+            }
         }
     }
 
@@ -1965,6 +2364,8 @@ impl TextEditor {
                 self.is_dirty = false;
                 self.undo_stack.clear();
                 self.redo_stack.clear();
+                self.diagnostics.clear();
+                self.diag_dirty = true;
                 println!("Loaded file: {}", path.display());
                 cx.notify();
             }
@@ -2186,9 +2587,15 @@ impl Focusable for TextEditor {
 /// - Text is rendered in monospace font for consistent character width
 impl Render for TextEditor {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-        // Cache window width for word-wrap calculations
+        // Cache window dimensions for word-wrap and viewport sizing.
         let window_bounds = window.bounds();
         self.window_width = window_bounds.size.width.into();
+        self.window_height = window_bounds.size.height.into();
+
+        // Recompute Brief diagnostics (debounced) when the buffer changed.
+        if self.diag_dirty {
+            self.schedule_diagnostics(cx);
+        }
 
         // Check if palette wants to open a file or close
         if let Some(palette_entity) = &self.palette {
@@ -2262,6 +2669,9 @@ impl Render for TextEditor {
             .on_action(cx.listener(Self::handle_open_folder))
             .on_action(cx.listener(Self::handle_undo))
             .on_action(cx.listener(Self::handle_redo))
+            .on_action(cx.listener(Self::handle_export_html))
+            .on_action(cx.listener(Self::handle_toggle_diagnostics))
+            .on_action(cx.listener(Self::handle_next_diagnostic))
             .on_mouse_move(cx.listener(|editor, event: &gpui::MouseMoveEvent, _, cx| {
                 editor.handle_mouse_move(event, cx);
             }))
@@ -2321,18 +2731,21 @@ impl Render for TextEditor {
                     return;
                 }
 
-                // Regular character input (only when palette is closed)
+                // Regular character input (only when palette is closed).
+                // Accept any printable text, including non-ASCII (accents, CJK,
+                // emoji); only control chars and modifier combos are rejected.
+                // IME commits may deliver several characters at once.
                 if editor.palette.is_none() && editor.find_panel.is_none() {
                     if let Some(key_char) = &event.keystroke.key_char {
-                        if key_char.len() == 1
-                            && !event.keystroke.modifiers.control
+                        if !event.keystroke.modifiers.control
                             && !event.keystroke.modifiers.alt
                             && !event.keystroke.modifiers.platform
+                            && !key_char.is_empty()
+                            && !key_char.chars().any(|c| c.is_control())
                         {
-                            if let Some(c) = key_char.chars().next() {
-                                if c.is_ascii_graphic() || c == ' ' {
-                                    editor.insert_char(c, cx);
-                                }
+                            let text = key_char.clone();
+                            for c in text.chars() {
+                                editor.insert_char(c, cx);
                             }
                         }
                     }
@@ -2390,23 +2803,50 @@ impl Render for TextEditor {
                         div().flex().flex_col().mt(px(-self.scroll_offset)).child({
                             let selection_range = self.get_selection_range();
                             let visual_lines = self.build_visual_lines();
+                            let line_modes = self.compute_line_modes();
                             let mut result = div().flex().flex_col();
                             let gutter_width = self.gutter_width();
                             let row_height = self.line_height();
                             let cursor_bar_height = self.cursor_height();
 
-                            for vl in visual_lines.iter() {
+                            // Viewport culling: only build elements for visual
+                            // lines inside (or just outside) the visible window,
+                            // bracketed by spacers that preserve scroll geometry.
+                            // This keeps a 100k-line file rendering as cheaply as
+                            // a one-screen file.
+                            let total_lines = visual_lines.len();
+                            let overscan = 4usize;
+                            let first_visible = ((self.scroll_offset / row_height).floor() as usize)
+                                .saturating_sub(overscan);
+                            let viewport_rows =
+                                (self.viewport_height() / row_height).ceil() as usize;
+                            let last_visible =
+                                (first_visible + viewport_rows + overscan * 2 + 1).min(total_lines);
+
+                            if first_visible > 0 {
+                                result = result
+                                    .child(div().h(px(first_visible as f32 * row_height)));
+                            }
+
+                            for vl in visual_lines[first_visible..last_visible].iter() {
                                 let mut line_wrapper = div().flex().flex_row().h(px(row_height));
 
-                                // Line number gutter (only on first visual line of content line)
+                                // Line number gutter (only on first visual line of content line).
+                                // Lines carrying a diagnostic are tinted red (error) or amber (warning).
                                 if vl.is_first {
+                                    let gutter_color = match self.line_diagnostic(vl.content_line + 1)
+                                    {
+                                        Some(true) => Rgba::from(gpui::rgb(DIAG_ERROR_COLOR)),
+                                        Some(false) => Rgba::from(gpui::rgb(DIAG_WARNING_COLOR)),
+                                        None => theme.editor.muted_text,
+                                    };
                                     line_wrapper = line_wrapper.child(
                                         div()
                                             .w(px(gutter_width))
                                             .flex()
                                             .justify_end()
                                             .pr_2()
-                                            .text_color(theme.editor.muted_text)
+                                            .text_color(gutter_color)
                                             .child(format!("{}", vl.content_line + 1)),
                                     );
                                 } else {
@@ -2425,7 +2865,12 @@ impl Render for TextEditor {
                                     .map(|p| vl.start_byte_in_content + p)
                                     .unwrap_or(self.content.len());
                                 let parent_text = &self.content[parent_line_start..parent_line_end];
-                                let runs = self.line_runs(parent_text, &theme.syntax);
+                                let line_mode = line_modes
+                                    .get(vl.content_line)
+                                    .copied()
+                                    .unwrap_or(LineMode::Normal);
+                                let runs =
+                                    self.runs_for_line(parent_text, line_mode, &theme.syntax);
 
                                 let mut token_byte = parent_line_start;
                                 for (text, token_color) in runs {
@@ -2505,6 +2950,12 @@ impl Render for TextEditor {
                                 result = result.child(line_wrapper);
                             }
 
+                            if last_visible < total_lines {
+                                result = result.child(
+                                    div().h(px((total_lines - last_visible) as f32 * row_height)),
+                                );
+                            }
+
                             result
                         }),
                     ))
@@ -2521,6 +2972,28 @@ impl Render for TextEditor {
                     .text_xs()
                     .text_color(theme.editor.muted_text)
                     .child(div().child(format!("Line {}", self.get_current_line_number())))
+                    .child({
+                        // Center: Brief diagnostics summary (Ctrl+Shift+D for the list).
+                        let (errors, warnings) = self.diagnostic_counts();
+                        if self.language != Language::Brief {
+                            div().child("Markdown")
+                        } else if errors == 0 && warnings == 0 {
+                            div().text_color(theme.editor.muted_text).child("✓ no issues")
+                        } else {
+                            let color = if errors > 0 {
+                                Rgba::from(gpui::rgb(DIAG_ERROR_COLOR))
+                            } else {
+                                Rgba::from(gpui::rgb(DIAG_WARNING_COLOR))
+                            };
+                            div().text_color(color).child(format!(
+                                "✗ {} error{} · ⚠ {} warning{} (Ctrl+Shift+D)",
+                                errors,
+                                if errors == 1 { "" } else { "s" },
+                                warnings,
+                                if warnings == 1 { "" } else { "s" },
+                            ))
+                        }
+                    })
                     .child(div().child(if self.is_dirty {
                         "● unsaved"
                     } else {
@@ -2674,6 +3147,58 @@ impl Render for TextEditor {
             container = container.child(goto_overlay);
         }
 
+        // Diagnostics list panel (toggle with Ctrl+Shift+D).
+        if self.show_diagnostics && self.language == Language::Brief {
+            let (errors, warnings) = self.diagnostic_counts();
+            let header = if self.diagnostics.is_empty() {
+                "No issues — document compiles cleanly".to_string()
+            } else {
+                format!("{} error(s), {} warning(s) · F8 to jump", errors, warnings)
+            };
+
+            let mut panel = div()
+                .absolute()
+                .bottom(px(self.padding() + self.line_height() + 16.0))
+                .right(px(self.padding()))
+                .w(px(440.0))
+                .max_h(px(260.0))
+                .bg(theme.panel.background)
+                .border_1()
+                .border_color(theme.panel.border)
+                .rounded_md()
+                .shadow_lg()
+                .flex()
+                .flex_col()
+                .gap_1()
+                .p_3()
+                .child(
+                    div()
+                        .text_xs()
+                        .text_color(theme.panel.label_text)
+                        .child(format!("Diagnostics — {}", header)),
+                );
+
+            for diag in self.diagnostics.iter().take(12) {
+                let color = if diag.is_error() {
+                    Rgba::from(gpui::rgb(DIAG_ERROR_COLOR))
+                } else {
+                    Rgba::from(gpui::rgb(DIAG_WARNING_COLOR))
+                };
+                panel = panel.child(
+                    div()
+                        .text_size(px(self.font_size() * 0.85))
+                        .font_family(font_family)
+                        .text_color(color)
+                        .child(format!(
+                            "{}:{}  [{}] {}",
+                            diag.line, diag.col, diag.code, diag.message
+                        )),
+                );
+            }
+
+            container = container.child(panel);
+        }
+
         // Add autocomplete overlay if active
         if let Some(autocomplete) = &self.autocomplete {
             let suggestions = autocomplete.get_suggestions_display();
@@ -2745,6 +3270,44 @@ impl Render for TextEditor {
     }
 }
 
+/// Derives the HTML export path from a source path by swapping the extension
+/// to `.html` (e.g. `notes.brf` → `notes.html`). Drafts without a real path
+/// land next to the temp dir.
+fn html_output_path(source_path: &str) -> PathBuf {
+    let path = Path::new(source_path);
+    if path.is_absolute()
+        || path
+            .parent()
+            .map(|p| !p.as_os_str().is_empty())
+            .unwrap_or(false)
+    {
+        path.with_extension("html")
+    } else {
+        std::env::temp_dir().join(path.with_extension("html").file_name().unwrap_or_default())
+    }
+}
+
+/// Opens a path in the platform's default browser, best-effort.
+fn open_in_browser(path: &Path) {
+    let path = path.to_string_lossy().to_string();
+    #[cfg(target_os = "macos")]
+    let cmd = ("open", vec![path]);
+    #[cfg(target_os = "windows")]
+    let cmd = (
+        "cmd",
+        vec!["/C".to_string(), "start".to_string(), String::new(), path],
+    );
+    #[cfg(all(unix, not(target_os = "macos")))]
+    let cmd = ("xdg-open", vec![path]);
+
+    if let Err(e) = std::process::Command::new(cmd.0).args(cmd.1).spawn() {
+        eprintln!(
+            "Export: could not open browser ({}); file written to disk",
+            e
+        );
+    }
+}
+
 /// Opens a fresh editor window. Used both at startup and when the user picks
 /// "Open Folder" — opening a folder must spawn a new window so the current
 /// draft is left untouched.
@@ -2766,4 +3329,92 @@ pub fn open_editor_window(
         },
     )
     .ok();
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{EditOperation, compute_diff};
+
+    /// Applies a diff record forward (redo direction) to a string.
+    fn apply(content: &str, op: &EditOperation) -> String {
+        let mut s = content.to_string();
+        let end = op.start + op.removed.len();
+        s.replace_range(op.start..end, &op.inserted);
+        s
+    }
+
+    /// Reverts a diff record (undo direction) on a string.
+    fn revert(content: &str, op: &EditOperation) -> String {
+        let mut s = content.to_string();
+        let end = op.start + op.inserted.len();
+        s.replace_range(op.start..end, &op.removed);
+        s
+    }
+
+    fn op_from(old: &str, new: &str) -> EditOperation {
+        let (start, removed, inserted) = compute_diff(old, new);
+        EditOperation {
+            start,
+            removed,
+            inserted,
+            old_cursor: 0,
+            new_cursor: 0,
+            old_selection: None,
+            new_selection: None,
+        }
+    }
+
+    #[test]
+    fn diff_insertion_in_middle() {
+        let (start, removed, inserted) = compute_diff("hello", "heLLO_llo");
+        // common prefix "he", common suffix "llo".
+        assert_eq!(start, 2);
+        assert_eq!(removed, "");
+        assert_eq!(inserted, "LLO_");
+    }
+
+    #[test]
+    fn diff_deletion() {
+        let (start, removed, inserted) = compute_diff("abcdef", "abef");
+        assert_eq!(start, 2);
+        assert_eq!(removed, "cd");
+        assert_eq!(inserted, "");
+    }
+
+    #[test]
+    fn diff_round_trips_through_undo_redo() {
+        let cases = [
+            ("", "a"),
+            ("hello", "hello world"),
+            ("hello world", "hello"),
+            ("abc", "axc"),
+            ("the quick fox", "the slow fox"),
+            ("café", "cafe"), // multibyte removed
+            ("cafe", "café"), // multibyte inserted
+            ("naïve café", "naive cafe"),
+            ("日本語", "日X語"), // multibyte both sides
+            ("a😀b", "a🚀b"),    // emoji swap (4-byte)
+        ];
+        for (old, new) in cases {
+            let op = op_from(old, new);
+            assert_eq!(apply(old, &op), new, "redo failed for {old:?}->{new:?}");
+            assert_eq!(revert(new, &op), old, "undo failed for {old:?}->{new:?}");
+        }
+    }
+
+    #[test]
+    fn diff_respects_char_boundaries() {
+        // é (0xC3 0xA9) vs è (0xC3 0xA8) share a leading byte; the diff must
+        // not split inside the codepoint.
+        let (start, removed, inserted) = compute_diff("é", "è");
+        assert!("é".is_char_boundary(start));
+        assert_eq!(removed, "é");
+        assert_eq!(inserted, "è");
+    }
+
+    #[test]
+    fn diff_identical_is_empty() {
+        let (_, removed, inserted) = compute_diff("same", "same");
+        assert!(removed.is_empty() && inserted.is_empty());
+    }
 }

@@ -15,7 +15,9 @@ MedleyText treats Brief as the default language for any unknown or `.brf`-extens
 - **Fuzzy file finder** (Ctrl+P / Ctrl+O) — surfaces `.brf` files first, then `.md`, scored across the working directory.
 - **Smart list continuation** that respects each language's rules (Brief: `-` only; Markdown: `-` / `*` / `+`).
 - **Shortcode autocomplete** triggered by `@` inside `.brf` buffers (`@link`, `@kbd`, `@math`, `@callout`, `@details`, `@t`, `@dl`, …).
-- Keyboard-driven workflow, GPU-accelerated rendering, configurable themes (Default + the four Catppuccin flavors), undo / redo, drag-select, word wrap, find / replace, go-to-line.
+- **Live Brief diagnostics** — the real [`brief-core`](https://crates.io/crates/brief-core) compiler runs in the background as you type. Because Brief is strict, it catches malformed headings, non-sequential ordered lists, unknown shortcodes, bad indentation, etc. Affected line numbers are tinted red (error) / amber (warning), the status bar shows a count, and `Ctrl+Shift+D` opens the full list (`F8` jumps to the next one).
+- **HTML export / preview** (`Ctrl+E`) — compiles the current Brief buffer to a standalone, styled HTML file next to the source and opens it in your browser.
+- Keyboard-driven workflow, GPU-accelerated rendering, configurable themes (Default + the four Catppuccin flavors), undo / redo (with typing coalesced into word-level steps), drag-select, word wrap, find / replace, go-to-line. Full Unicode input (accents, CJK, emoji). Viewport culling keeps large files responsive.
 
 ## Usage
 
@@ -29,7 +31,10 @@ medleytext notes.md     # Markdown (highlighter switches automatically)
 
 - `Ctrl+O` / `Ctrl+P` — open fuzzy file finder
 - `Ctrl+S` — save
-- `Ctrl+Q` — quit
+- `Ctrl+E` — export current Brief buffer to HTML and open it in the browser
+- `Ctrl+Shift+D` — toggle the diagnostics list (Brief buffers)
+- `F8` — jump to the next diagnostic
+- `Ctrl+Q` — quit (prompts if there are unsaved changes)
 - `Ctrl+A` — select all
 - `Ctrl+C` / `Ctrl+V` / `Ctrl+X` — copy / paste / cut
 - `Ctrl+Z` / `Ctrl+Shift+Z` (or `Ctrl+Y`) — undo / redo

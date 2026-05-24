@@ -51,11 +51,6 @@ print(greet("World"))
 Press @kbd[Ctrl+S] to save. See @link[the Brief spec](https://docs.brief.kirillleventcov.com/)
 for the full grammar. Inline math: @math[E = m c^2].
 
-@callout(kind: note)
-Block shortcodes open with @name(args) and close with @end. The single
-extension point — no inline HTML in Brief.
-@end
-
 @details(summary: "Click to expand")
 Hidden content lives inside the body of a block shortcode.
 @end
